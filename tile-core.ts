@@ -12,8 +12,11 @@ export interface PackedTile {
   lod: number;
   cells: BigUint64Array;
   ncell: Uint32Array;
-  /** One per value column, the stored codes. */
+  /** One per scalar value column, the stored codes. */
   values: Int8Array[];
+  /** The vector column (an embedding), `dim` codes a cell, row by row; null without one. */
+  vector: Int8Array | null;
+  dim: number;
   /** Vertex start of each cell, n + 1 entries. */
   starts: Uint32Array;
   /** lon, lat per vertex (open rings). */
@@ -59,8 +62,10 @@ export const AEF_DECODE = (() => {
  * tile, scaled to its whole weight, keeps the cost per tile near fixed. */
 export const STATS_ROWS = 4096;
 
-export function tileStats(values: Int8Array[], ncell: Uint32Array, n: number): TileStats {
-  const d = values.length;
+/** A tile's PCA sums over its vector column, or over its scalar columns. */
+export function tileStats(t: { values: Int8Array[]; vector: Int8Array | null; dim: number; ncell: Uint32Array; n: number }): TileStats {
+  const { values, vector, ncell, n } = t;
+  const d = vector ? t.dim : values.length;
   const sum = new Float64Array(d);
   const cross = new Float64Array((d * (d + 1)) / 2);
   const x = new Float64Array(d);
@@ -71,7 +76,8 @@ export function tileStats(values: Int8Array[], ncell: Uint32Array, n: number): T
   for (let i = 0; i < n; i += step) {
     const w = ncell[i];
     wSample += w;
-    for (let k = 0; k < d; k++) x[k] = AEF_DECODE[values[k][i] + 128];
+    if (vector) for (let k = 0; k < d; k++) x[k] = AEF_DECODE[vector[i * d + k] + 128];
+    else for (let k = 0; k < d; k++) x[k] = AEF_DECODE[values[k][i] + 128];
     let at = 0;
     for (let j = 0; j < d; j++) {
       const wx = w * x[j];
@@ -133,7 +139,9 @@ export function keyValues(metadata: FileMetaData): Record<string, string> {
 }
 
 /** Read tile `tile` (row group) of an open shard and pack it. */
-export async function readTile(url: string, tile: number, lod: number, columns: string[], withStats = false): Promise<PackedTile> {
+export async function readTile(
+  url: string, tile: number, lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
+): Promise<PackedTile> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
   const t0 = performance.now();
@@ -153,7 +161,7 @@ export async function readTile(url: string, tile: number, lod: number, columns: 
     metadata: s.metadata,
     rowStart: s.rowStarts[tile],
     rowEnd: s.rowStarts[tile + 1],
-    columns: ["cell", "ncell", ...columns],
+    columns: ["cell", "ncell", ...columns, ...(vector ? [vector.name] : [])],
     onChunk: (c) => {
       const list = chunks.get(c.columnName) ?? [];
       list.push(c.columnData as ArrayLike<unknown>);
@@ -171,12 +179,26 @@ export async function readTile(url: string, tile: number, lod: number, columns: 
     copyInto(out, chunks.get(name) ?? [], (v) => (v == null ? 0 : Number(v)));
     return out;
   });
+  // a vector column arrives as one Uint8Array of `dim` bytes a row
+  const dim = vector?.dim ?? 0;
+  let vec: Int8Array | null = null;
+  if (vector) {
+    vec = new Int8Array(n * dim);
+    let i = 0;
+    for (const part of chunks.get(vector.name) ?? []) {
+      for (let j = 0; j < part.length && i < n; j++, i++) {
+        const row = part[j] as Uint8Array;
+        vec.set(new Int8Array(row.buffer, row.byteOffset, dim), i * dim);
+      }
+    }
+    if (i !== n) throw new Error(`vector column has ${i} rows for ${n}`);
+  }
   const t2 = performance.now();
-  const stats = withStats ? tileStats(values, ncell, n) : null;
+  const stats = withStats ? tileStats({ values, vector: vec, dim, ncell, n }) : null;
   const statsMs = performance.now() - t2;
   const packed = pack(cells, lod);
   const byteLength =
-    cells.byteLength + ncell.byteLength + values.reduce((a, v) => a + v.byteLength, 0) +
+    cells.byteLength + ncell.byteLength + values.reduce((a, v) => a + v.byteLength, 0) + (vec?.byteLength ?? 0) +
     packed.starts.byteLength + packed.positions.byteLength + (packed.indices?.byteLength ?? 0) +
     // per-vertex colours, built later on the main thread
     (packed.positions.length / 2) * 4;
@@ -186,6 +208,8 @@ export async function readTile(url: string, tile: number, lod: number, columns: 
     cells,
     ncell,
     values,
+    vector: vec,
+    dim,
     ...packed,
     byteLength,
     fetched,
@@ -241,6 +265,7 @@ export function pack(cells: BigUint64Array, lod: number) {
 /** The transferable buffers of a packed tile. */
 export function transferables(t: PackedTile): ArrayBuffer[] {
   const out = [t.cells.buffer, t.ncell.buffer, t.starts.buffer, t.positions.buffer, ...t.values.map((v) => v.buffer)];
+  if (t.vector) out.push(t.vector.buffer);
   if (t.indices) out.push(t.indices.buffer);
   if (t.stats) out.push(t.stats.sum.buffer, t.stats.cross.buffer);
   return out as ArrayBuffer[];

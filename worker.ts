@@ -5,7 +5,10 @@ import { keyValues, openShard, hasShard, readTile, transferables } from "./tile-
 
 export type WorkerRequest =
   | { id: number; type: "index"; url: string; bytes: number; footer: ArrayBuffer }
-  | { id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number; columns: string[]; stats?: boolean };
+  | {
+      id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number;
+      columns: string[]; stats?: boolean; vector?: { name: string; dim: number } | null;
+    };
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -21,7 +24,7 @@ ctx.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
       if (!m.footer) throw new Error(`no footer for ${m.url}`);
       openShard(m.url, m.bytes, m.footer);
     }
-    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false);
+    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null);
     ctx.postMessage({ id: m.id, tile }, transferables(tile));
   } catch (e) {
     ctx.postMessage({ id: m.id, error: String((e as Error)?.message ?? e) });

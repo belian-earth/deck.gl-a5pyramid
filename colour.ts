@@ -37,10 +37,28 @@ export function bandColouring(stretch: Stretch): Colouring {
   return { version: nextVersion++, colour: (t) => colours(t, stretch) };
 }
 
+/** One grey for every cell: a set coloured from its view (PCA) until the
+ * view's first tiles have loaded. */
+export function neutralColouring(): Colouring {
+  return {
+    version: nextVersion++,
+    colour: (t) => {
+      const out = new Uint8Array(t.starts[t.n] * 4);
+      for (let v = 0; v < out.length; v += 4) {
+        out[v] = out[v + 1] = out[v + 2] = 150;
+        out[v + 3] = 200;
+      }
+      return out;
+    },
+  };
+}
+
 const tables = new WeakMap<Stretch, Uint8Array[]>();
 
-/** Per-vertex RGBA for the first three value columns of `t`. */
+/** Per-vertex RGBA for the first three value columns of `t` (grey for a
+ * tile without three). */
 export function colours(t: PackedTile, stretch: Stretch): Uint8Array {
+  if (t.values.length < 3) return neutralColouring().colour(t);
   let luts = tables.get(stretch);
   if (!luts) {
     luts = stretch.ranges.map(table);

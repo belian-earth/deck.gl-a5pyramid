@@ -193,14 +193,32 @@ export function pcaColouring(basis: PcaBasis): Colouring & { basis: PcaBasis; co
         acc[3 * i + 1] = offset[1];
         acc[3 * i + 2] = offset[2];
       }
-      for (let k = 0; k < d && k < t.values.length; k++) {
-        const col = t.values[k];
-        const base = k * 768 + 384;
+      const vec = t.vector;
+      if (vec && t.dim === d) {
+        // row by row: a cell's codes are contiguous
         for (let i = 0; i < n; i++) {
-          const o = base + col[i] * 3;
-          acc[3 * i] += table[o];
-          acc[3 * i + 1] += table[o + 1];
-          acc[3 * i + 2] += table[o + 2];
+          let r = acc[3 * i], g = acc[3 * i + 1], b = acc[3 * i + 2];
+          const row = i * d;
+          for (let k = 0; k < d; k++) {
+            const o = k * 768 + 384 + vec[row + k] * 3;
+            r += table[o];
+            g += table[o + 1];
+            b += table[o + 2];
+          }
+          acc[3 * i] = r;
+          acc[3 * i + 1] = g;
+          acc[3 * i + 2] = b;
+        }
+      } else {
+        for (let k = 0; k < d && k < t.values.length; k++) {
+          const col = t.values[k];
+          const base = k * 768 + 384;
+          for (let i = 0; i < n; i++) {
+            const o = base + col[i] * 3;
+            acc[3 * i] += table[o];
+            acc[3 * i + 1] += table[o + 1];
+            acc[3 * i + 2] += table[o + 2];
+          }
         }
       }
       const nv = t.starts[n];

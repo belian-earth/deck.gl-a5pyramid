@@ -228,7 +228,9 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
         cell: t.cells[info.index],
         lod: t.lod,
         ncell: t.ncell[info.index],
-        values: t.values.map((v) => v[info.index]),
+        values: t.vector
+          ? Array.from(t.vector.subarray(info.index * t.dim, (info.index + 1) * t.dim))
+          : t.values.map((v) => v[info.index]),
       } satisfies CellInfo;
     }
     return info;

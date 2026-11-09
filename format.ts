@@ -1,4 +1,4 @@
-// The a5pyramid set format (a5pyramid FORMAT.md, "Pyramid sets", version 2):
+// The a5pyramid set format (a5pyramid FORMAT.md, "Pyramid sets"; version 3 adds vector columns):
 // set.json and each shard's index, as this reader takes them.
 
 /** `[west, south, east, north]` in degrees; `west > east` crosses the antimeridian. */
@@ -25,6 +25,10 @@ export interface ColumnMeta {
   name: string;
   type: string;
   reducer: string;
+  /** rep_child: the standard deviation that scaled the column. */
+  sd?: number;
+  /** A vector column (format version 3): elements per cell, one byte each. */
+  dim?: number;
 }
 
 export interface SetIndex {
@@ -60,7 +64,7 @@ export interface PyramidIndex {
 }
 
 /** The newest format version this reader reads, and the A5 index of a5-js 1.x. */
-export const FORMAT_VERSION = 2;
+export const FORMAT_VERSION = 3;
 export const A5_INDEX = "1.0";
 
 export function checkSet(s: SetIndex): SetIndex {

@@ -169,6 +169,8 @@ export class PyramidSource {
   readonly id = ++sources;
   readonly lods: number[];
   readonly columns: string[];
+  /** The set's vector column and its elements per cell, or null. */
+  readonly vector: { name: string; dim: number } | null;
   /** Bumped whenever a shard opens, so tile selection is redone. */
   version = 0;
   /** Called when a shard opens; the layer redraws. */
@@ -190,7 +192,10 @@ export class PyramidSource {
 
   private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number) {
     this.lods = setLods(set);
-    this.columns = set.columns.map((c) => c.name);
+    // scalar columns by name; the vector column (an embedding), if any, apart
+    this.columns = set.columns.filter((c) => c.dim == null).map((c) => c.name);
+    const v = set.columns.find((c) => c.dim != null);
+    this.vector = v ? { name: v.name, dim: v.dim! } : null;
     try {
       this.meta = JSON.parse(set.metadata?.a5pyramids ?? "{}");
     } catch {
@@ -321,7 +326,7 @@ export class PyramidSource {
     const { job, promise } = this.pool.submit(
       (id, needsFooter) => ({
         id, type: "decode", url: s.url, bytes: s.entry.bytes, footer: needsFooter ? footer.slice(0) : undefined,
-        tile: Number(i), lod, columns: this.columns, stats: this.pca,
+        tile: Number(i), lod, columns: this.columns, stats: this.pca, vector: this.vector,
       }),
       s.url,
     );
