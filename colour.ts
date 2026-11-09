@@ -20,6 +20,23 @@ function table([lo, hi]: [number, number]): Uint8Array {
   return out;
 }
 
+/**
+ * How tiles are coloured: per-vertex RGBA for a tile, and a version that
+ * changes whenever the colours would, so the layer recolours tiles it
+ * already holds without reading them again.
+ */
+export interface Colouring {
+  version: number;
+  colour(t: PackedTile): Uint8Array;
+}
+
+let nextVersion = 1;
+
+/** The first three bands as red, green and blue, each through its stretch. */
+export function bandColouring(stretch: Stretch): Colouring {
+  return { version: nextVersion++, colour: (t) => colours(t, stretch) };
+}
+
 const tables = new WeakMap<Stretch, Uint8Array[]>();
 
 /** Per-vertex RGBA for the first three value columns of `t`. */

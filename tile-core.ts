@@ -26,6 +26,63 @@ export interface PackedTile {
   fetched: number;
   readMs: number;
   packMs: number;
+  /** The tile's sums for a PCA of its decoded values (when asked for). */
+  stats: TileStats | null;
+  statsMs: number;
+}
+
+/**
+ * What a PCA of the values needs from a tile, summed so tiles combine by
+ * adding: the total weight, the weighted sum of each column and the
+ * weighted sum of each product of two columns (upper triangle, row by row).
+ * Values are decoded (AEF codes to embedding values) and weighted by ncell,
+ * so a coarse cell stands for its leaves.
+ */
+export interface TileStats {
+  d: number;
+  w: number;
+  sum: Float64Array;
+  cross: Float64Array;
+}
+
+/** AEF codes as the embedding values they stand for: sign(x) * (x / 127.5)^2. */
+export const AEF_DECODE = (() => {
+  const t = new Float64Array(256);
+  for (let c = -128; c < 128; c++) {
+    const x = c / 127.5;
+    t[c + 128] = Math.sign(c) * x * x;
+  }
+  return t;
+})();
+
+/** Rows a tile's PCA sums are taken from at most: an even sample of a larger
+ * tile, scaled to its whole weight, keeps the cost per tile near fixed. */
+export const STATS_ROWS = 4096;
+
+export function tileStats(values: Int8Array[], ncell: Uint32Array, n: number): TileStats {
+  const d = values.length;
+  const sum = new Float64Array(d);
+  const cross = new Float64Array((d * (d + 1)) / 2);
+  const x = new Float64Array(d);
+  const step = Math.max(1, Math.ceil(n / STATS_ROWS));
+  let wAll = 0;
+  for (let i = 0; i < n; i++) wAll += ncell[i];
+  let wSample = 0;
+  for (let i = 0; i < n; i += step) {
+    const w = ncell[i];
+    wSample += w;
+    for (let k = 0; k < d; k++) x[k] = AEF_DECODE[values[k][i] + 128];
+    let at = 0;
+    for (let j = 0; j < d; j++) {
+      const wx = w * x[j];
+      sum[j] += wx;
+      for (let k = j; k < d; k++) cross[at++] += wx * x[k];
+    }
+  }
+  const scale = wSample > 0 ? wAll / wSample : 0;
+  for (let j = 0; j < d; j++) sum[j] *= scale;
+  for (let j = 0; j < cross.length; j++) cross[j] *= scale;
+  return { d, w: wAll, sum, cross };
 }
 
 /** Cells at this LOD or coarser are triangulated by deck (earcut): their
@@ -76,7 +133,7 @@ export function keyValues(metadata: FileMetaData): Record<string, string> {
 }
 
 /** Read tile `tile` (row group) of an open shard and pack it. */
-export async function readTile(url: string, tile: number, lod: number, columns: string[]): Promise<PackedTile> {
+export async function readTile(url: string, tile: number, lod: number, columns: string[], withStats = false): Promise<PackedTile> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
   const t0 = performance.now();
@@ -114,6 +171,9 @@ export async function readTile(url: string, tile: number, lod: number, columns: 
     copyInto(out, chunks.get(name) ?? [], (v) => (v == null ? 0 : Number(v)));
     return out;
   });
+  const t2 = performance.now();
+  const stats = withStats ? tileStats(values, ncell, n) : null;
+  const statsMs = performance.now() - t2;
   const packed = pack(cells, lod);
   const byteLength =
     cells.byteLength + ncell.byteLength + values.reduce((a, v) => a + v.byteLength, 0) +
@@ -130,7 +190,9 @@ export async function readTile(url: string, tile: number, lod: number, columns: 
     byteLength,
     fetched,
     readMs: t1 - t0,
-    packMs: performance.now() - t1,
+    packMs: performance.now() - t2 - statsMs,
+    stats,
+    statsMs,
   };
 }
 
@@ -180,5 +242,6 @@ export function pack(cells: BigUint64Array, lod: number) {
 export function transferables(t: PackedTile): ArrayBuffer[] {
   const out = [t.cells.buffer, t.ncell.buffer, t.starts.buffer, t.positions.buffer, ...t.values.map((v) => v.buffer)];
   if (t.indices) out.push(t.indices.buffer);
+  if (t.stats) out.push(t.stats.sum.buffer, t.stats.cross.buffer);
   return out as ArrayBuffer[];
 }

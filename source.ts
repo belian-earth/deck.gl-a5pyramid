@@ -44,6 +44,8 @@ export interface SourceStats {
   tilesDecoded: number;
   readMs: number;
   packMs: number;
+  /** Worker time spent on tiles' PCA sums. */
+  statsMs: number;
   cached: number;
   cachedBytes: number;
   inFlight: number;
@@ -160,7 +162,11 @@ class Pool {
   }
 }
 
+let sources = 0;
+
 export class PyramidSource {
+  /** Unique per source opened: layers drawing it key their state on it. */
+  readonly id = ++sources;
   readonly lods: number[];
   readonly columns: string[];
   /** Bumped whenever a shard opens, so tile selection is redone. */
@@ -168,8 +174,12 @@ export class PyramidSource {
   /** Called when a shard opens; the layer redraws. */
   onChange: (() => void) | null = null;
   readonly stats: SourceStats = {
-    cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, packMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
+    cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, packMs: 0, statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
   };
+  /** The set's metadata from its writer (the `a5pyramids` entry), parsed. */
+  readonly meta: Record<string, any>;
+  /** Whether tiles come with PCA sums: the set's colour is "pca". */
+  readonly pca: boolean;
 
   private shards: ShardState[];
   private byPath = new Map<string, ShardState>();
@@ -181,6 +191,12 @@ export class PyramidSource {
   private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number) {
     this.lods = setLods(set);
     this.columns = set.columns.map((c) => c.name);
+    try {
+      this.meta = JSON.parse(set.metadata?.a5pyramids ?? "{}");
+    } catch {
+      this.meta = {};
+    }
+    this.pca = this.meta.colour === "pca";
     this.shards = set.shards.map((entry) => ({ entry, url: new URL(entry.path, base).href }));
     for (const s of this.shards) this.byPath.set(s.entry.path, s);
     this.pool = new Pool(workers);
@@ -305,7 +321,7 @@ export class PyramidSource {
     const { job, promise } = this.pool.submit(
       (id, needsFooter) => ({
         id, type: "decode", url: s.url, bytes: s.entry.bytes, footer: needsFooter ? footer.slice(0) : undefined,
-        tile: Number(i), lod, columns: this.columns,
+        tile: Number(i), lod, columns: this.columns, stats: this.pca,
       }),
       s.url,
     );
@@ -315,6 +331,7 @@ export class PyramidSource {
       this.stats.tileBytes += t.fetched;
       this.stats.readMs += t.readMs;
       this.stats.packMs += t.packMs;
+      this.stats.statsMs += t.statsMs;
       if (this.jobs.get(key) === job) this.jobs.delete(key);
       this.remember(key, t.byteLength);
       return t;
