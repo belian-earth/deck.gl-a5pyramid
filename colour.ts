@@ -1,83 +1,67 @@
-// Colouring a tile from its stored codes: each band stretched linearly
-// between two codes to 0..255, through a 256-entry table per band, written
-// per vertex (deck.gl's binary polygons take one colour per vertex).
+// How tiles are coloured. The GPU computes each cell's colour from the codes
+// the tile uploaded once (codes-layer.ts): red, green and blue are each an
+// affine function of the cell's codes, or of the values they decode to,
+// clamped to 0..1. A colouring is that function's weights and offsets, about
+// 1 KB of uniforms, so a new colouring redraws without touching the cells.
 
-import type { PackedTile } from "./tile-core";
+import { MAX_INPUTS } from "./tile-core";
 
 export interface Stretch {
   /** `[low, high]` code per band, in the order of the set's columns. */
   ranges: [number, number][];
-  /** Changes whenever the ranges do, so tiles are recoloured. */
+  /** Changes whenever the ranges do. */
   version: number;
 }
 
-function table([lo, hi]: [number, number]): Uint8Array {
-  const out = new Uint8Array(256);
-  const span = hi - lo || 1;
-  for (let c = -128; c < 128; c++) {
-    out[c + 128] = Math.round(Math.min(1, Math.max(0, (c - lo) / span)) * 255);
-  }
-  return out;
-}
+/** Vec4s of weights: one row of MAX_INPUTS / 4 a channel. */
+export const WEIGHT_VEC4S = 3 * (MAX_INPUTS / 4);
 
-/**
- * How tiles are coloured: per-vertex RGBA for a tile, and a version that
- * changes whenever the colours would, so the layer recolours tiles it
- * already holds without reading them again.
- */
 export interface Colouring {
+  /** Changes whenever the colours would. */
   version: number;
-  colour(t: PackedTile): Uint8Array;
+  /**
+   * Weight of input k in channel ch (0 red, 1 green, 2 blue) at
+   * weightIndex(ch, k): the shader's WEIGHT_VEC4S vec4s, a channel's row
+   * of them dotted with the cell's codes four at a time.
+   */
+  weights: Float32Array;
+  /** Red, green and blue at all-zero inputs, and the alpha, 0..1. */
+  offset: [number, number, number, number];
+  /** Inputs are the decoded AEF values, sign(x) (x / 127.5)^2, not the codes. */
+  decode: boolean;
+}
+
+export function weightIndex(ch: number, k: number): number {
+  return (ch * (MAX_INPUTS / 4) + (k >> 2)) * 4 + (k & 3);
 }
 
 let nextVersion = 1;
 
-/** The first three bands as red, green and blue, each through its stretch. */
+/** A colouring from its parts; `weights` starts at zero. */
+export function colouring(offset: [number, number, number, number], decode: boolean, fill?: (w: Float32Array) => void): Colouring {
+  const weights = new Float32Array(WEIGHT_VEC4S * 4);
+  fill?.(weights);
+  return { version: nextVersion++, weights, offset, decode };
+}
+
+/** The first three bands as red, green and blue, each stretched linearly
+ * between two codes. */
 export function bandColouring(stretch: Stretch): Colouring {
-  return { version: nextVersion++, colour: (t) => colours(t, stretch) };
+  const offset: [number, number, number, number] = [0, 0, 0, 1];
+  return colouring(offset, false, (w) => {
+    for (let ch = 0; ch < 3 && ch < stretch.ranges.length; ch++) {
+      const [lo, hi] = stretch.ranges[ch];
+      const span = hi - lo || 1;
+      w[weightIndex(ch, ch)] = 1 / span;
+      offset[ch] = -lo / span;
+    }
+  });
 }
 
 /** One grey for every cell: a set coloured from its view (PCA) until the
  * view's first tiles have loaded. */
 export function neutralColouring(): Colouring {
-  return {
-    version: nextVersion++,
-    colour: (t) => {
-      const out = new Uint8Array(t.starts[t.n] * 4);
-      for (let v = 0; v < out.length; v += 4) {
-        out[v] = out[v + 1] = out[v + 2] = 150;
-        out[v + 3] = 200;
-      }
-      return out;
-    },
-  };
-}
-
-const tables = new WeakMap<Stretch, Uint8Array[]>();
-
-/** Per-vertex RGBA for the first three value columns of `t` (grey for a
- * tile without three). */
-export function colours(t: PackedTile, stretch: Stretch): Uint8Array {
-  if (t.values.length < 3) return neutralColouring().colour(t);
-  let luts = tables.get(stretch);
-  if (!luts) {
-    luts = stretch.ranges.map(table);
-    tables.set(stretch, luts);
-  }
-  const [r, g, b] = [0, 1, 2].map((k) => t.values[k]);
-  const [lr, lg, lb] = luts;
-  const nv = t.starts[t.n];
-  const out = new Uint8Array(nv * 4);
-  for (let i = 0; i < t.n; i++) {
-    const cr = lr[r[i] + 128], cg = lg[g[i] + 128], cb = lb[b[i] + 128];
-    for (let v = t.starts[i]; v < t.starts[i + 1]; v++) {
-      out[4 * v] = cr;
-      out[4 * v + 1] = cg;
-      out[4 * v + 2] = cb;
-      out[4 * v + 3] = 255;
-    }
-  }
-  return out;
+  return colouring([150 / 255, 150 / 255, 150 / 255, 200 / 255], false);
 }
 
 /** An AEF code as the embedding value it stands for. */

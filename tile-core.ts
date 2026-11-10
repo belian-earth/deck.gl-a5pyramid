@@ -17,6 +17,17 @@ export interface PackedTile {
   /** The vector column (an embedding), `dim` codes a cell, row by row; null without one. */
   vector: Int8Array | null;
   dim: number;
+  /**
+   * Every code of the tile laid out as an RGBA8 texture for the GPU colouring
+   * (codesLayout): `codesRows` rows of `codesWidth` texels, each cell's codes
+   * in `texels` consecutive texels of one row, `perRow` cells a row. The
+   * vector, when its width is a multiple of 4, is a view of these bytes.
+   */
+  codes: Uint8Array;
+  codesWidth: number;
+  codesRows: number;
+  texels: number;
+  perRow: number;
   /** Vertex start of each cell, n + 1 entries. */
   starts: Uint32Array;
   /** lon, lat per vertex (open rings). */
@@ -89,6 +100,18 @@ export function tileStats(t: { values: Int8Array[]; vector: Int8Array | null; di
   for (let j = 0; j < d; j++) sum[j] *= scale;
   for (let j = 0; j < cross.length; j++) cross[j] *= scale;
   return { d, w: wAll, sum, cross };
+}
+
+/** Texels a row of a codes texture at most (WebGL 2 guarantees 2048). */
+export const CODES_WIDTH = 2048;
+/** Codes a cell the GPU colouring reads at most: 16 RGBA texels. */
+export const MAX_INPUTS = 64;
+
+/** Where a tile of `n` cells with `d` codes each puts them in its texture. */
+export function codesLayout(n: number, d: number) {
+  const texels = Math.max(1, Math.ceil(Math.min(d, MAX_INPUTS) / 4));
+  const perRow = Math.floor(CODES_WIDTH / texels);
+  return { texels, perRow, width: perRow * texels, rows: Math.max(1, Math.ceil(n / perRow)) };
 }
 
 /** Cells at this LOD or coarser are triangulated by deck (earcut): their
@@ -179,11 +202,16 @@ export async function readTile(
     copyInto(out, chunks.get(name) ?? [], (v) => (v == null ? 0 : Number(v)));
     return out;
   });
-  // a vector column arrives as one Uint8Array of `dim` bytes a row
+  // the codes texture; a vector column (one Uint8Array of `dim` bytes a row)
+  // is read straight into it when its rows are whole texels, as AEF's 64 are
   const dim = vector?.dim ?? 0;
+  const layout = codesLayout(n, vector ? dim : columns.length);
+  const codes = new Uint8Array(layout.rows * layout.width * 4);
+  const at = (i: number) => (Math.floor(i / layout.perRow) * layout.width + (i % layout.perRow) * layout.texels) * 4;
   let vec: Int8Array | null = null;
   if (vector) {
-    vec = new Int8Array(n * dim);
+    const direct = dim % 4 === 0 && dim <= MAX_INPUTS;
+    vec = direct ? new Int8Array(codes.buffer, 0, n * dim) : new Int8Array(n * dim);
     let i = 0;
     for (const part of chunks.get(vector.name) ?? []) {
       for (let j = 0; j < part.length && i < n; j++, i++) {
@@ -192,16 +220,25 @@ export async function readTile(
       }
     }
     if (i !== n) throw new Error(`vector column has ${i} rows for ${n}`);
+    if (!direct) {
+      const m = Math.min(dim, MAX_INPUTS);
+      for (let c = 0; c < n; c++) for (let k = 0; k < m; k++) codes[at(c) + k] = vec[c * dim + k] & 255;
+    }
+  } else {
+    const m = Math.min(values.length, MAX_INPUTS);
+    for (let c = 0; c < n; c++) {
+      const o = at(c);
+      for (let k = 0; k < m; k++) codes[o + k] = values[k][c] & 255;
+    }
   }
   const t2 = performance.now();
   const stats = withStats ? tileStats({ values, vector: vec, dim, ncell, n }) : null;
   const statsMs = performance.now() - t2;
   const packed = pack(cells, lod);
   const byteLength =
-    cells.byteLength + ncell.byteLength + values.reduce((a, v) => a + v.byteLength, 0) + (vec?.byteLength ?? 0) +
-    packed.starts.byteLength + packed.positions.byteLength + (packed.indices?.byteLength ?? 0) +
-    // per-vertex colours, built later on the main thread
-    (packed.positions.length / 2) * 4;
+    cells.byteLength + ncell.byteLength + values.reduce((a, v) => a + v.byteLength, 0) + codes.byteLength +
+    (vec && vec.buffer !== codes.buffer ? vec.byteLength : 0) +
+    packed.starts.byteLength + packed.positions.byteLength + (packed.indices?.byteLength ?? 0);
   return {
     n,
     lod,
@@ -210,6 +247,11 @@ export async function readTile(
     values,
     vector: vec,
     dim,
+    codes,
+    codesWidth: layout.width,
+    codesRows: layout.rows,
+    texels: layout.texels,
+    perRow: layout.perRow,
     ...packed,
     byteLength,
     fetched,
@@ -264,8 +306,9 @@ export function pack(cells: BigUint64Array, lod: number) {
 
 /** The transferable buffers of a packed tile. */
 export function transferables(t: PackedTile): ArrayBuffer[] {
-  const out = [t.cells.buffer, t.ncell.buffer, t.starts.buffer, t.positions.buffer, ...t.values.map((v) => v.buffer)];
-  if (t.vector) out.push(t.vector.buffer);
+  const out = [t.cells.buffer, t.ncell.buffer, t.starts.buffer, t.positions.buffer, t.codes.buffer, ...t.values.map((v) => v.buffer)];
+  // (a buffer listed twice fails the transfer)
+  if (t.vector && t.vector.buffer !== t.codes.buffer) out.push(t.vector.buffer);
   if (t.indices) out.push(t.indices.buffer);
   if (t.stats) out.push(t.stats.sum.buffer, t.stats.cross.buffer);
   return out as ArrayBuffer[];

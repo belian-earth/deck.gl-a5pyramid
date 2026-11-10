@@ -1,16 +1,17 @@
-// Zoom to A5 resolution and viewport boxes, ported from a5view's tiling.js
-// (inst/htmlwidgets/lib/a5view-tiling/tiling.js, 2026-11-09).
+// The A5 resolution for a view, and viewport boxes (the boxes ported from
+// a5view's tiling.js, inst/htmlwidgets/lib/a5view-tiling/tiling.js,
+// 2026-11-09).
+//
+// a5view chose the resolution from a table of (zoom, resolution) anchors,
+// which gives cells of 0.6 to 2.3 CSS pixels depending on the zoom. Here it
+// comes from the cells' size on screen: A5 cells are equal-area, so a
+// resolution's cell size is exact (the square root of its area), and the
+// view's scale is Web Mercator's at its centre. The coarsest resolution
+// whose cells are at most `px` pixels across is drawn, as deck.gl-raster
+// picks the coarsest overview at least as fine as the screen.
 
+import { cellArea } from "a5-js";
 import type { Box } from "./format";
-
-/** (zoom, resolution) anchors, interpolated between and extrapolated beyond. */
-export const ZOOM_TO_RES: [number, number][] = [
-  [0, 7],
-  [3, 10],
-  [7, 14],
-  [10, 15],
-  [16, 22],
-];
 
 /** Fraction of the view added on each side when choosing tiles. */
 export const VIEWPORT_BUFFER = 0.1;
@@ -21,34 +22,34 @@ interface ViewportLike {
   getBounds?: () => number[];
 }
 
-/**
- * The A5 resolution for a view: the anchors' interpolation at the zoom, with
- * a small boost at high latitudes (Mercator pixels cover less ground there)
- * and `bias` resolutions added (negative for coarser cells).
- */
-export function a5Resolution(viewport: ViewportLike, bias = 0): number {
-  let z = viewport.zoom || 0;
-  const lat = viewport.latitude || 0;
-  z += Math.log(1 / Math.max(0.05, Math.cos((lat * Math.PI) / 180)));
-  const t = ZOOM_TO_RES;
-  let r: number;
-  if (z <= t[0][0]) {
-    const slope = (t[1][1] - t[0][1]) / (t[1][0] - t[0][0]);
-    r = t[0][1] + slope * (z - t[0][0]);
-  } else {
-    let i = 1;
-    while (i < t.length && z > t[i][0]) i++;
-    if (i === t.length) {
-      const n = t.length;
-      const slope = (t[n - 1][1] - t[n - 2][1]) / (t[n - 1][0] - t[n - 2][0]);
-      r = t[n - 1][1] + slope * (z - t[n - 1][0]);
-    } else {
-      const [z0, r0] = t[i - 1];
-      const [z1, r1] = t[i];
-      r = r0 + ((z - z0) / (z1 - z0)) * (r1 - r0);
-    }
-  }
-  return Math.max(0, Math.floor(r + bias));
+/** Web Mercator's equator, metres (WGS 84 semi-major axis). */
+const EQUATOR_M = 2 * Math.PI * 6378137;
+
+/** A cell's size at each resolution, metres: the square root of its area. */
+const CELL_M = Array.from({ length: 31 }, (_, r) => Math.sqrt(cellArea(r)));
+
+export function cellSize(resolution: number): number {
+  return CELL_M[Math.max(0, Math.min(30, resolution))];
+}
+
+/** Metres a CSS pixel spans at a zoom and latitude (512-pixel tiles, as
+ * MapLibre's and deck.gl's zooms count them). */
+export function metresPerPixel(zoom: number, latitude = 0): number {
+  const cos = Math.max(0.01, Math.cos((latitude * Math.PI) / 180));
+  return (EQUATOR_M * cos) / (512 * 2 ** zoom);
+}
+
+/** CSS pixels across a cell of `resolution` at the view's centre. */
+export function cellPixels(resolution: number, viewport: ViewportLike): number {
+  return cellSize(resolution) / metresPerPixel(viewport.zoom || 0, viewport.latitude || 0);
+}
+
+/** The coarsest A5 resolution whose cells are at most `px` CSS pixels
+ * across at the view's centre. */
+export function a5Resolution(viewport: ViewportLike, px = 1): number {
+  const limit = px * metresPerPixel(viewport.zoom || 0, viewport.latitude || 0);
+  for (let r = 0; r <= 30; r++) if (CELL_M[r] <= limit) return r;
+  return 30;
 }
 
 /** The finest LOD of `lods` (ascending) at or below `r`, else the coarsest. */

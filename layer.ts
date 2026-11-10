@@ -21,9 +21,12 @@
 //     (a5view decoded outside deck and marked tiles dirty);
 //   - cells finer than FAN_MIN_LOD come with fan triangles, so deck.gl skips
 //     earcut, its largest per-tile cost in a5view;
-//   - colours come from the stored codes on the main thread through a
-//     Colouring (a band stretch, or the PCA of the view), so new colours
-//     apply to tiles without reading them again;
+//   - colours are computed on the GPU from the codes each tile uploads once
+//     (codes-layer.ts), through a Colouring of a few uniforms (a band
+//     stretch, or the PCA of the view), so new colours redraw without
+//     reading, packing or uploading a tile again;
+//   - the LOD is the coarsest whose cells are at most `cellPx` CSS pixels
+//     across at the view's centre (tiling.ts), not a5view's zoom table;
 //   - a backdrop level, BACKDROP_STEP LODs coarser than the one wanted (a
 //     sixteenth of its cells at 2), is read ahead of every other tile and
 //     drawn under a level still loading, so a view is covered, coarsely,
@@ -31,7 +34,8 @@
 
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
-import { SolidPolygonLayer } from "@deck.gl/layers";
+import { CodesPolygonLayer, type Palette } from "./codes-layer";
+import { boxesMeet } from "./format";
 import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling";
 import type { Colouring } from "./colour";
 import type { PyramidSource } from "./source";
@@ -66,8 +70,8 @@ export interface RenderStats {
 export interface A5PyramidLayerProps extends LayerProps {
   source: PyramidSource;
   colouring: Colouring;
-  /** Resolutions added to the zoom's A5 resolution; negative for coarser cells. */
-  lodBias?: number;
+  /** Cells drawn at most this many CSS pixels across (the square root of their area). */
+  cellPx?: number;
   /** Filled in as the layer draws: the LOD shown and its tiles. Read it on a timer. */
   stats?: RenderStats;
 }
@@ -195,15 +199,28 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
     private lastKey: string | null = null;
     private lastIndices: { i: string }[] = [];
 
+    private heldKey: string | null = null;
+    private heldIndices: { i: string }[] = [];
+
     getTileIndices(opts: { viewport: any }) {
-      // a level held on screen while another loads keeps the tiles it has:
-      // it would otherwise read tiles for a view it will not be shown in
-      // (after a zoom out, a hundred of them)
-      if (this.lastKey != null && swap.pending != null && lod !== swap.pending && lod !== swap.backdrop) {
-        return this.lastIndices as any;
-      }
       const box = viewportBox(opts.viewport);
       const key = boxKey(box) + "|" + source.version;
+      // a level held on screen while another loads adds no tiles: it would
+      // otherwise read tiles for a view it will not be shown in (after a
+      // zoom out, a hundred of them). It keeps those of its tiles still in
+      // view, and drops (and so aborts) the rest: a flight can leave it
+      // holding a selection made far from where the view ends.
+      if (this.lastKey != null && swap.pending != null && lod !== swap.pending && lod !== swap.backdrop) {
+        if (key !== this.heldKey) {
+          this.heldKey = key;
+          this.heldIndices = this.lastIndices.filter((t) => {
+            const b = source.tileBox(t.i);
+            return !b || boxesMeet(b, box);
+          });
+        }
+        return this.heldIndices as any;
+      }
+      this.heldKey = null;
       if (key !== this.lastKey) {
         this.lastKey = key;
         this.lastIndices = source.tilesIn(lod, box).map((t) => ({ i: t.key }));
@@ -246,18 +263,19 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
 
 export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   static layerName = "A5PyramidLayer";
-  static defaultProps = { lodBias: 0, pickable: true };
+  static defaultProps = { cellPx: 1, pickable: true };
 
   declare state: {
     swap: Swap;
     tilesets: Map<number, ReturnType<typeof tilesetClass>>;
-    datas: WeakMap<PackedTile, { version: number; data: unknown }>;
+    datas: WeakMap<PackedTile, unknown>;
+    palette: Palette;
   };
 
   initializeState() {
     const swap = new Swap();
     swap.redraw = () => this.setNeedsUpdate();
-    this.setState({ swap, tilesets: new Map(), datas: new WeakMap() });
+    this.setState({ swap, tilesets: new Map(), datas: new WeakMap(), palette: { colouring: this.props.colouring } });
     this.props.source.onChange = () => swap.later();
   }
 
@@ -266,6 +284,11 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   }
 
   updateState({ props, oldProps }: UpdateParameters<this>) {
+    // every tile's layer reads the palette as it draws: new colours are a redraw
+    if (props.colouring !== this.state.palette.colouring) {
+      this.state.palette.colouring = props.colouring;
+      this.setNeedsRedraw();
+    }
     if (props.source !== oldProps.source) {
       this.state.tilesets.clear();
       this.state.swap.shown = null;
@@ -303,8 +326,8 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   }
 
   private tileLayer(lod: number, urgent = false) {
-    const { source, colouring, opacity, pickable } = this.props;
-    const datas = this.state.datas;
+    const { source, opacity, pickable } = this.props;
+    const { datas, palette } = this.state;
     return new PyramidTileLayer(
       this.getSubLayerProps({
         // per source: deck keeps a TileLayer's tileset across prop changes,
@@ -326,24 +349,22 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
         maxCacheByteSize: 256 * 1024 * 1024,
         pickable,
         opacity,
-        updateTriggers: { renderSubLayers: colouring.version },
         getTileData: (tile: any) => source.tile(tile.index.i, lod, tile.signal, urgent),
         renderSubLayers: (p: any) => {
           const t = p.data as PackedTile | null;
           if (!t || t.n === 0) return null;
-          let d = datas.get(t);
-          if (!d || d.version !== colouring.version) {
-            const attributes: Record<string, unknown> = {
-              getPolygon: { value: t.positions, size: 2 },
-              getFillColor: { value: colouring.colour(t), size: 4 },
-            };
+          let data = datas.get(t);
+          if (!data) {
+            const attributes: Record<string, unknown> = { getPolygon: { value: t.positions, size: 2 } };
             if (t.indices) attributes.indices = { value: t.indices, size: 1 };
-            d = { version: colouring.version, data: { length: t.n, startIndices: t.starts, attributes } };
-            datas.set(t, d);
+            data = { length: t.n, startIndices: t.starts, attributes };
+            datas.set(t, data);
           }
-          return new SolidPolygonLayer({
+          return new CodesPolygonLayer({
             id: p.id,
-            data: d.data as any,
+            data: data as any,
+            packed: t,
+            palette,
             _normalize: false,
             _windingOrder: "CCW",
             positionFormat: "XY",
@@ -358,11 +379,11 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   }
 
   renderLayers(): Layer[] {
-    const { source, lodBias = 0, stats } = this.props;
+    const { source, cellPx = 1, stats } = this.props;
     const swap = this.state.swap;
     swap.sink = stats ?? null;
     const vp = this.context.viewport;
-    const lod = pickLod(a5Resolution(vp, lodBias), source.lods);
+    const lod = pickLod(a5Resolution(vp, cellPx), source.lods);
     const tier = source.tierOf(lod);
     const box = viewportBox(vp);
     const back = pickLod(lod - BACKDROP_STEP, source.lods);

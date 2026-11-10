@@ -7,8 +7,8 @@
 // basis is matched to the previous one (axis order and sign), so colours
 // shift with the view rather than jump.
 
-import type { Colouring } from "./colour";
-import { AEF_DECODE, type PackedTile, type TileStats } from "./tile-core";
+import { colouring, weightIndex, type Colouring } from "./colour";
+import { AEF_DECODE, MAX_INPUTS, type PackedTile, type TileStats } from "./tile-core";
 
 export interface PcaBasis {
   d: number;
@@ -161,85 +161,25 @@ export function pcaBasis(tiles: PackedTile[], prev: PcaBasis | null = null): Pca
   return { d, mean, axes, variance, total, rank, tiles: stats.length, weight: w, ms: performance.now() - t0 };
 }
 
-let nextVersion = 1_000_000;
-
-/** Colours from a basis: each channel's score stretched over mean +/- 2 sd. */
-export function pcaColouring(basis: PcaBasis): Colouring & { basis: PcaBasis; colourMs: number } {
+/**
+ * Colours from a basis, for the GPU: each channel's score stretched over the
+ * view's mean +/- 2 standard deviations, as weights on the decoded values.
+ */
+export function pcaColouring(basis: PcaBasis): Colouring & { basis: PcaBasis } {
   const { d, axes, mean, variance } = basis;
-  // per column, per code: its contribution to each channel, gain included
-  const table = new Float32Array(d * 256 * 3);
-  const offset = new Float32Array(3);
-  for (let ch = 0; ch < 3; ch++) {
-    const sd = Math.sqrt(variance[ch]) || 1;
-    const gain = 127.5 / (2 * sd);
-    let centre = 0;
-    for (let k = 0; k < d; k++) centre += axes[ch * d + k] * mean[k];
-    offset[ch] = 127.5 - gain * centre;
-    for (let k = 0; k < d; k++) {
-      const a = axes[ch * d + k] * gain;
-      for (let code = 0; code < 256; code++) table[(k * 256 + code) * 3 + ch] = a * AEF_DECODE[code];
+  const offset: [number, number, number, number] = [0, 0, 0, 1];
+  const c = colouring(offset, true, (w) => {
+    for (let ch = 0; ch < 3; ch++) {
+      const sd = Math.sqrt(variance[ch]) || 1;
+      // 0..1 across mean +/- 2 sd
+      const gain = 1 / (4 * sd);
+      let centre = 0;
+      for (let k = 0; k < d; k++) centre += axes[ch * d + k] * mean[k];
+      offset[ch] = 0.5 - gain * centre;
+      for (let k = 0; k < d && k < MAX_INPUTS; k++) w[weightIndex(ch, k)] = axes[ch * d + k] * gain;
     }
-  }
-  const out = {
-    version: nextVersion++,
-    basis,
-    colourMs: 0,
-    colour(t: PackedTile): Uint8Array {
-      const t0 = performance.now();
-      const n = t.n;
-      const acc = new Float32Array(3 * n);
-      for (let i = 0; i < n; i++) {
-        acc[3 * i] = offset[0];
-        acc[3 * i + 1] = offset[1];
-        acc[3 * i + 2] = offset[2];
-      }
-      const vec = t.vector;
-      if (vec && t.dim === d) {
-        // row by row: a cell's codes are contiguous
-        for (let i = 0; i < n; i++) {
-          let r = acc[3 * i], g = acc[3 * i + 1], b = acc[3 * i + 2];
-          const row = i * d;
-          for (let k = 0; k < d; k++) {
-            const o = k * 768 + 384 + vec[row + k] * 3;
-            r += table[o];
-            g += table[o + 1];
-            b += table[o + 2];
-          }
-          acc[3 * i] = r;
-          acc[3 * i + 1] = g;
-          acc[3 * i + 2] = b;
-        }
-      } else {
-        for (let k = 0; k < d && k < t.values.length; k++) {
-          const col = t.values[k];
-          const base = k * 768 + 384;
-          for (let i = 0; i < n; i++) {
-            const o = base + col[i] * 3;
-            acc[3 * i] += table[o];
-            acc[3 * i + 1] += table[o + 1];
-            acc[3 * i + 2] += table[o + 2];
-          }
-        }
-      }
-      const nv = t.starts[n];
-      const rgba = new Uint8Array(nv * 4);
-      for (let i = 0; i < n; i++) {
-        const r = acc[3 * i], g = acc[3 * i + 1], b = acc[3 * i + 2];
-        const cr = r < 0 ? 0 : r > 255 ? 255 : r;
-        const cg = g < 0 ? 0 : g > 255 ? 255 : g;
-        const cb = b < 0 ? 0 : b > 255 ? 255 : b;
-        for (let v = t.starts[i]; v < t.starts[i + 1]; v++) {
-          rgba[4 * v] = cr;
-          rgba[4 * v + 1] = cg;
-          rgba[4 * v + 2] = cb;
-          rgba[4 * v + 3] = 255;
-        }
-      }
-      out.colourMs += performance.now() - t0;
-      return rgba;
-    },
-  };
-  return out;
+  });
+  return { ...c, basis };
 }
 
 /** A cell's three channel scores, in standard deviations from the view's mean. */
