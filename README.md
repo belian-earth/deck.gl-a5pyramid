@@ -134,7 +134,29 @@ npm run build          # dist/
 `test/fixtures` holds two small sets written by a5pyramid
 (`tools/fixtures.R`): three int8 bands, and a 64-code vector.
 
+## Acknowledgements
+
+- **[deck.gl-raster](https://github.com/developmentseed/deck.gl-raster)**
+  (Development Seed), read at commit 6da743d for what makes it fast. Its
+  approaches, not its code, are behind: colouring on the GPU from codes
+  uploaded once, with the colouring as shader uniforms (its AEF mosaic
+  example draws the same embeddings); aborting the loads of tiles that left
+  the view at once (`abortUnwantedLoads`); choosing the level from screen
+  pixels; and leaving range requests uncoalesced, after its finding that
+  coalescing gains nothing at about 1 MB a tile.
+- **[A5](https://github.com/felixpalmer/a5)** (Felix Palmer), through
+  a5-js. Its cells are equal-area, which makes the pixel rule exact, and its
+  ids follow a space-filling curve, so a tile, a run of consecutive ids, is
+  a compact patch, which the base level's mask relies on.
+- **[hyparquet](https://github.com/hyparam/hyparquet)** (Hyperparam):
+  Parquet read in the browser, a row group at a time, over range requests.
+- **[deck.gl](https://deck.gl) and [luma.gl](https://luma.gl)** (vis.gl,
+  OpenJS Foundation): the rendering, including the internals this layer
+  depends on.
+- **AlphaEarth Foundations Satellite Embedding dataset** (Google and Google
+  DeepMind, CC BY 4.0): the 64-band embeddings this was built to draw. The
+  test fixtures are synthetic.
+
 ## Licence
 
-Apache 2.0. The AlphaEarth Foundations Satellite Embedding dataset is produced
-by Google and Google DeepMind and published under CC BY 4.0.
+Apache 2.0.
