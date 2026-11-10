@@ -313,3 +313,35 @@ export function transferables(t: PackedTile): ArrayBuffer[] {
   if (t.stats) out.push(t.stats.sum.buffer, t.stats.cross.buffer);
   return out as ArrayBuffer[];
 }
+
+/** A message to a decode worker. */
+export type WorkerRequest =
+  | { id: number; type: "index"; url: string; bytes: number; footer: ArrayBuffer }
+  | {
+      id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number;
+      columns: string[]; stats?: boolean; vector?: { name: string; dim: number } | null;
+    };
+
+/**
+ * What a worker does with a message: open a shard (its index, and each
+ * tile's rows and compressed bytes, for the view budget) or read a tile.
+ * The reply echoes the id, with a result or an error.
+ */
+export async function handleRequest(m: WorkerRequest): Promise<{ reply: Record<string, unknown>; transfer: ArrayBuffer[] }> {
+  try {
+    if (m.type === "index") {
+      const md = openShard(m.url, m.bytes, m.footer);
+      const tileRows = md.row_groups.map((rg) => Number(rg.num_rows));
+      const tileBytes = md.row_groups.map((rg) => rg.columns.reduce((a, c) => a + Number(c.meta_data?.total_compressed_size ?? 0), 0));
+      return { reply: { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes }, transfer: [] };
+    }
+    if (!hasShard(m.url)) {
+      if (!m.footer) throw new Error(`no footer for ${m.url}`);
+      openShard(m.url, m.bytes, m.footer);
+    }
+    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null);
+    return { reply: { id: m.id, tile }, transfer: transferables(tile) };
+  } catch (e) {
+    return { reply: { id: m.id, error: String((e as Error)?.message ?? e) }, transfer: [] };
+  }
+}

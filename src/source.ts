@@ -15,13 +15,13 @@ import {
   type PyramidIndex,
   type SetIndex,
   type ShardEntry,
-} from "./format";
-import type { PackedTile } from "./tile-core";
-import { boxKey } from "./tiling";
+} from "./format.js";
+import type { PackedTile } from "./tile-core.js";
+import { boxKey } from "./tiling.js";
 
 /** A box meeting every tile. */
 export const WORLD: Box = [-180, -90, 180, 90];
-import type { WorkerRequest } from "./worker";
+import type { WorkerRequest } from "./tile-core.js";
 
 /** Makes one decode worker (worker.ts). */
 export type WorkerFactory = () => Worker;
@@ -273,7 +273,8 @@ export class PyramidSource {
    * (default 512 MB); `worker`: how to make a worker (default the bundled one).
    */
   static async open(base: string, opts: { workers?: number; cacheBytes?: number; worker?: WorkerFactory } = {}): Promise<PyramidSource> {
-    const url = new URL(base.endsWith("/") ? base : base + "/", location.href).href;
+    // relative to the page, where there is one
+    const url = new URL(base.endsWith("/") ? base : base + "/", globalThis.location?.href).href;
     const res = await fetch(new URL("set.json", url));
     if (!res.ok) throw new Error(`${url}set.json: HTTP ${res.status}`);
     const set = checkSet(await res.json());
@@ -287,8 +288,10 @@ export class PyramidSource {
 
   /** Requests sent to the workers and not yet answered. */
   get inFlight() {
-    return this.pool.inFlight;
+    return this.pool.inFlight + this.footersOpening;
   }
+  /** Footers being read (before their index reaches a worker). */
+  private footersOpening = 0;
 
   close() {
     this.pool.terminate();
@@ -319,6 +322,7 @@ export class PyramidSource {
     if (s.opening) return s.opening;
     const { bytes, footer_bytes } = s.entry;
     s.opening = (async () => {
+      this.footersOpening++;
       try {
         const res = await fetch(s.url, { headers: { Range: `bytes=${bytes - footer_bytes}-${bytes - 1}` } });
         if (res.status !== 206 && res.status !== 200) throw new Error(`HTTP ${res.status}`);
@@ -339,7 +343,9 @@ export class PyramidSource {
         this.onChange?.();
       } catch (e) {
         s.failed = String((e as Error)?.message ?? e);
-        console.error(`[a5-pyramids] ${s.entry.path}: ${s.failed}`);
+        console.error(`[deck.gl-a5pyramid] ${s.entry.path}: ${s.failed}`);
+      } finally {
+        this.footersOpening--;
       }
     })();
     return s.opening;

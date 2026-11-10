@@ -1,0 +1,75 @@
+{
+  "name": "deck.gl-a5pyramid",
+  "version": "0.1.0",
+  "description": "Draw a5pyramid sets (A5 cells in Parquet, read with HTTP range requests) in deck.gl, coloured on the GPU",
+  "license": "Apache-2.0",
+  "author": "Belian (https://belian.earth)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/belian-earth/deck.gl-a5pyramid.git"
+  },
+  "keywords": [
+    "deck.gl",
+    "a5",
+    "dggs",
+    "parquet",
+    "geoparquet",
+    "pyramid",
+    "webgl"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "LICENSE.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "prepare": "npm run build",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "a5-js": "^1.0.0",
+    "hyparquet": "^1.31.2"
+  },
+  "peerDependencies": {
+    "@deck.gl/core": "~9.4.0",
+    "@deck.gl/geo-layers": "~9.4.0",
+    "@deck.gl/layers": "~9.4.0",
+    "@luma.gl/core": "~9.4.0",
+    "@luma.gl/engine": "~9.4.0",
+    "@luma.gl/shadertools": "~9.4.0"
+  },
+  "devDependencies": {
+    "@deck.gl/core": "~9.4.0",
+    "@deck.gl/extensions": "~9.4.0",
+    "@deck.gl/geo-layers": "~9.4.0",
+    "@deck.gl/layers": "~9.4.0",
+    "@deck.gl/mesh-layers": "~9.4.0",
+    "@luma.gl/core": "~9.4.0",
+    "@luma.gl/engine": "~9.4.0",
+    "@luma.gl/gltf": "~9.4.0",
+    "@luma.gl/shadertools": "~9.4.0",
+    "@luma.gl/webgl": "~9.4.0",
+    "@playwright/test": "^1.65.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.7",
+    "vitest": "^5.1.0"
+  }
+}

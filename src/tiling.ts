@@ -11,7 +11,7 @@
 // picks the coarsest overview at least as fine as the screen.
 
 import { cellArea } from "a5-js";
-import type { Box } from "./format";
+import type { Box } from "./format.js";
 
 /** Fraction of the view added on each side when choosing tiles. */
 export const VIEWPORT_BUFFER = 0.1;

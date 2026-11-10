@@ -44,13 +44,13 @@
 
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
-import { CodesPolygonLayer, cellKey, type Cover, type Palette } from "./codes-layer";
-import { BASE_BUDGET, DEFAULT_BUDGET, chooseLevel, type Budget } from "./budget";
-import { boxesMeet, type Box } from "./format";
-import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling";
-import type { Colouring } from "./colour";
-import { WORLD, type PyramidSource } from "./source";
-import type { PackedTile } from "./tile-core";
+import { CodesPolygonLayer, cellKey, type Cover, type Palette } from "./codes-layer.js";
+import { BASE_BUDGET, DEFAULT_BUDGET, chooseLevel, type Budget } from "./budget.js";
+import { boxesMeet, type Box } from "./format.js";
+import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling.js";
+import type { Colouring } from "./colour.js";
+import { WORLD, type PyramidSource } from "./source.js";
+import type { PackedTile } from "./tile-core.js";
 
 export const MAX_HOLD_MS = 1500;
 /** LODs between the level wanted and its backdrop. */
@@ -65,6 +65,8 @@ export interface CellInfo {
 
 export interface RenderStats {
   lod: number | null;
+  /** The level shown has every tile in view, every shard of its tier there opened. */
+  ready: boolean;
   /** The level the pixel target asks for, and why a coarser one is drawn. */
   targetLod: number | null;
   capped: "bytes" | "cells" | null;
@@ -99,15 +101,15 @@ export interface A5PyramidLayerProps extends LayerProps {
   onStats?: (stats: RenderStats) => void;
 }
 
-/** Whether a view has settled: no level pending, every tile of the level
- * shown loaded, and nothing in flight at the source. */
+/** Whether a view has settled: no level pending, the level shown ready
+ * (every tile in view loaded, its shards opened), nothing in flight. */
 export function isSettled(stats: RenderStats, source: PyramidSource): boolean {
-  return stats.lod != null && stats.pendingLod == null && stats.tilesSelected === stats.tilesLoaded && source.inFlight === 0;
+  return stats.ready && stats.pendingLod == null && source.inFlight === 0;
 }
 
 export function emptyRenderStats(): RenderStats {
   return {
-    lod: null, targetLod: null, capped: null, viewBytes: null, viewCells: null, tier: 0, pendingLod: null, tilesSelected: 0, tilesLoaded: 0, cellsDrawn: 0, tiles: [],
+    lod: null, ready: false, targetLod: null, capped: null, viewBytes: null, viewCells: null, tier: 0, pendingLod: null, tilesSelected: 0, tilesLoaded: 0, cellsDrawn: 0, tiles: [],
     backdropLod: null, backdrop: [], backdropReady: false,
   };
 }
@@ -190,6 +192,7 @@ class Swap {
     this.loaded.set(lod, counts);
     this.contents.set(lod, contents);
     if (this.sink && lod === this.shown) {
+      this.sink.ready = ready;
       this.sink.tilesSelected = counts.selected;
       this.sink.tilesLoaded = counts.loaded;
       this.sink.cellsDrawn = counts.cells;
@@ -268,7 +271,7 @@ class PyramidTileLayer extends TileLayer<PackedTile, PyramidTileLayerProps> {
   }
 }
 
-function tilesetClass(source: PyramidSource, lod: number, swap: Swap, all = false) {
+function tilesetClass(source: PyramidSource, lod: number, swap: Swap, all = false): typeof Tileset2D {
   return class extends Tileset2D {
     private lastKey: string | null = null;
     private lastIndices: { i: string }[] = [];
@@ -353,10 +356,10 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
 
   declare state: {
     swap: Swap;
-    tilesets: Map<number, ReturnType<typeof tilesetClass>>;
+    tilesets: Map<number, typeof Tileset2D>;
     datas: WeakMap<PackedTile, unknown>;
     palette: Palette;
-    baseTileset: ReturnType<typeof tilesetClass> | null;
+    baseTileset: typeof Tileset2D | null;
     stats: RenderStats;
     statsKey: string;
     statsQueued: boolean;
@@ -384,7 +387,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
       this.state.statsQueued = false;
       const r = this.state.stats;
       const key = [
-        r.lod, r.pendingLod, r.targetLod, r.capped, r.viewBytes, r.viewCells, r.tilesSelected, r.tilesLoaded, r.cellsDrawn,
+        r.lod, r.ready, r.pendingLod, r.targetLod, r.capped, r.viewBytes, r.viewCells, r.tilesSelected, r.tilesLoaded, r.cellsDrawn,
         r.backdropLod, r.backdrop.length, r.backdropReady, r.tiles.length,
       ].join("|");
       if (key === this.state.statsKey) return;
@@ -595,6 +598,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     stats.backdropReady = b != null && !!swap.ready.get(b);
     const c = swap.loaded.get(swap.shown ?? lod) ?? { selected: 0, loaded: 0, cells: 0 };
     stats.lod = swap.shown;
+    stats.ready = swap.shown != null && !!swap.ready.get(swap.shown);
     stats.tier = source.tierOf(swap.shown ?? lod);
     stats.pendingLod = swap.pending;
     stats.tilesSelected = c.selected;

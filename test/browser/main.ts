@@ -1,0 +1,78 @@
+// The browser test's page: draws a fixture set with plain deck.gl and
+// exposes check(), which reads back the drawn pixel at cells' centres and
+// compares it with the colouring's formula on the CPU.
+
+import { Deck, MapView } from "@deck.gl/core";
+import { cellToLonLat } from "a5-js";
+import {
+  A5PyramidLayer, PyramidSource, bandColouring, isSettled, pcaBasis, pcaColouring,
+  type Colouring, type PcaBasis, type RenderStats,
+} from "../../src/index.js";
+
+const decode = (c: number) => Math.sign(c) * (c / 127.5) ** 2;
+
+async function show(name: string, cellPx: number) {
+  const source = await PyramidSource.open(`/${name}/`);
+  let stats: RenderStats | null = null;
+  let basis: PcaBasis | null = null;
+  let colouring: Colouring = bandColouring({ ranges: [[-100, 100], [-100, 100], [-40, 80]], version: 0 });
+  const deck = new Deck({
+    canvas: "map",
+    views: new MapView({}),
+    initialViewState: { longitude: 117.8, latitude: 4.96, zoom: 15.6 },
+    controller: false,
+    layers: [],
+  });
+  const layer = () => new A5PyramidLayer({ id: "p", source, colouring, cellPx, onStats: (s: RenderStats) => (stats = s) });
+  deck.setProps({ layers: [layer()] });
+  const t0 = performance.now();
+  while (!(stats && isSettled(stats, source)) && performance.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 50));
+  if (source.pca && stats) {
+    basis = pcaBasis((stats as RenderStats).tiles);
+    colouring = pcaColouring(basis!);
+    deck.setProps({ layers: [layer()] });
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return { deck, source, stats: stats as RenderStats | null, basis };
+}
+
+/** Pixels at picked cells' centres against the formula: the worst channel error. */
+async function check(name: string) {
+  const { deck, source, stats, basis } = await show(name, 8);
+  const gl = (deck as any).device.gl as WebGL2RenderingContext;
+  const canvas = (deck as any).canvas as HTMLCanvasElement;
+  const vp = deck.getViewports()[0];
+  const dpr = canvas.width / canvas.clientWidth;
+  let worst = 0, cells = 0;
+  for (let y = 40; y < 560; y += 37) {
+    for (let x = 40; x < 760; x += 41) {
+      const info = deck.pickObject({ x, y, radius: 0 });
+      const o = info?.object as { cell: bigint; values: number[] } | undefined;
+      if (!o) continue;
+      const [cx, cy] = vp.project(cellToLonLat(o.cell) as unknown as [number, number]);
+      if (deck.pickObject({ x: cx, y: cy, radius: 0 })?.object?.cell !== o.cell) continue;
+      let want: number[];
+      if (basis) {
+        want = [0, 1, 2].map((ch) => {
+          let s = 0;
+          for (let k = 0; k < basis.d; k++) s += basis.axes[ch * basis.d + k] * (decode(o.values[k]) - basis.mean[k]);
+          return Math.round(Math.min(255, Math.max(0, 127.5 + (127.5 * s) / (2 * Math.sqrt(basis.variance[ch])))));
+        });
+      } else {
+        const r: [number, number][] = [[-100, 100], [-100, 100], [-40, 80]];
+        want = r.map(([lo, hi], k) => Math.round(Math.min(1, Math.max(0, (o.values[k] - lo) / (hi - lo))) * 255));
+      }
+      deck.redraw("check");
+      const px = new Uint8Array(4);
+      gl.readPixels(Math.round(cx * dpr), canvas.height - Math.round(cy * dpr) - 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      worst = Math.max(worst, ...want.map((w, k) => Math.abs(w - px[k])));
+      cells++;
+    }
+  }
+  const out = { name, lod: stats?.lod ?? null, tiles: stats?.tilesLoaded ?? 0, cells, worst };
+  deck.finalize();
+  source.close();
+  return out;
+}
+
+(window as any).check = check;

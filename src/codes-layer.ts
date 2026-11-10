@@ -30,11 +30,11 @@ import type { UpdateParameters } from "@deck.gl/core";
 import { SolidPolygonLayer } from "@deck.gl/layers";
 import type { Texture } from "@luma.gl/core";
 import type { ShaderModule } from "@luma.gl/shadertools";
-import { WEIGHT_VEC4S, type Colouring } from "./colour";
+import { WEIGHT_VEC4S, type Colouring } from "./colour.js";
 import { lonLatToCell } from "a5-js";
-import type { Box } from "./format";
-import { boxKey, viewportBox } from "./tiling";
-import { MAX_INPUTS, type PackedTile } from "./tile-core";
+import type { Box } from "./format.js";
+import { boxKey, viewportBox } from "./tiling.js";
+import { MAX_INPUTS, type PackedTile } from "./tile-core.js";
 
 const ROW = MAX_INPUTS / 4;
 /** Cells a row of a mask texture (one byte each). */
@@ -53,7 +53,7 @@ export function cellKey(id: bigint): number {
   return Number(id >> 11n);
 }
 
-function inRuns(runs: Float64Array, k: number): boolean {
+export function inRuns(runs: Float64Array, k: number): boolean {
   // the last pair starting at or before k
   let lo = 0, hi = runs.length / 2 - 1, at = -1;
   while (lo <= hi) {

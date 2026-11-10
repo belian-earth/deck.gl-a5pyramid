@@ -7,8 +7,8 @@
 // basis is matched to the previous one (axis order and sign), so colours
 // shift with the view rather than jump.
 
-import { colouring, weightIndex, type Colouring } from "./colour";
-import { AEF_DECODE, MAX_INPUTS, type PackedTile, type TileStats } from "./tile-core";
+import { colouring, weightIndex, type Colouring } from "./colour.js";
+import { AEF_DECODE, MAX_INPUTS, type PackedTile, type TileStats } from "./tile-core.js";
 
 export interface PcaBasis {
   d: number;

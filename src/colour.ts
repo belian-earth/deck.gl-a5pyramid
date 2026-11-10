@@ -4,7 +4,7 @@
 // clamped to 0..1. A colouring is that function's weights and offsets, about
 // 1 KB of uniforms, so a new colouring redraws without touching the cells.
 
-import { MAX_INPUTS } from "./tile-core";
+import { MAX_INPUTS } from "./tile-core.js";
 
 export interface Stretch {
   /** `[low, high]` code per band, in the order of the set's columns. */
