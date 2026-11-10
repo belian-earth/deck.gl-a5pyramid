@@ -62,15 +62,21 @@ interface Job {
   started: boolean;
   /** Read before any other job (the backdrop level's tiles). */
   urgent: boolean;
+  /** Its batch (one per task that submitted jobs) and order of submission. */
+  batch: number;
+  seq: number;
 }
 
 /**
  * Workers fed from one queue on the main thread, at most PER_WORKER requests
- * each at a time, newest first: the latest view's tiles are read before the
- * ones a camera move passed through, and those not yet started are dropped
- * once deck.gl no longer wants them. Urgent jobs (the backdrop level's tiles)
- * go first, and nothing else starts while one is queued or running, so on a
- * slow link they have the bandwidth to themselves.
+ * each at a time. The newest batch first (the requests of one task: deck.gl
+ * issues a view's tiles together), so the latest view's tiles are read
+ * before the ones a camera move passed through; within a batch in the order
+ * asked, which is deck.gl's, nearest the centre of the view first. Jobs not
+ * yet started are dropped once deck.gl no longer wants them. Urgent jobs
+ * (the backdrop level's tiles, shard indexes) go first, and nothing else
+ * starts while one is queued or running, so on a slow link they have the
+ * bandwidth to themselves.
  */
 class Pool {
   static PER_WORKER = 2;
@@ -79,6 +85,9 @@ class Pool {
   private queue: Job[] = [];
   private urgent: Job[] = [];
   private urgentRunning = 0;
+  private batch = 0;
+  private batchOpen = false;
+  private seq = 0;
   private next = 1;
 
   constructor(size: number) {
@@ -115,8 +124,9 @@ class Pool {
   submit(build: Job["build"], shard: string, urgent = false): { job: Job; promise: Promise<any> } {
     let job!: Job;
     const promise = new Promise<any>((resolve, reject) => {
-      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent };
+      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent, batch: 0, seq: 0 };
     });
+    this.stamp(job);
     (urgent ? this.urgent : this.queue).push(job);
     this.pump();
     return { job, promise };
@@ -130,6 +140,7 @@ class Pool {
     if (i < 0) return;
     from.splice(i, 1);
     job.urgent ||= urgent;
+    this.stamp(job);
     (job.urgent ? this.urgent : this.queue).push(job);
     this.pump();
   }
@@ -144,6 +155,27 @@ class Pool {
     return true;
   }
 
+  /** Place a job in the current batch, after the jobs already in it. */
+  private stamp(job: Job) {
+    if (!this.batchOpen) {
+      this.batch++;
+      this.batchOpen = true;
+      setTimeout(() => (this.batchOpen = false), 0);
+    }
+    job.batch = this.batch;
+    job.seq = this.seq++;
+  }
+
+  /** Take the next job of `line`: the newest batch, the first asked in it. */
+  private take(line: Job[]): Job {
+    let best = 0;
+    for (let i = 1; i < line.length; i++) {
+      const a = line[i], b = line[best];
+      if (a.batch > b.batch || (a.batch === b.batch && a.seq < b.seq)) best = i;
+    }
+    return line.splice(best, 1)[0];
+  }
+
   private pump() {
     while (this.urgent.length || (this.queue.length && !this.urgentRunning)) {
       let slot = -1;
@@ -151,7 +183,7 @@ class Pool {
         if (this.workers[i].busy < Pool.PER_WORKER && (slot < 0 || this.workers[i].busy < this.workers[slot].busy)) slot = i;
       }
       if (slot < 0) return;
-      const job = (this.urgent.length ? this.urgent : this.queue).pop()!;
+      const job = this.take(this.urgent.length ? this.urgent : this.queue);
       job.started = true;
       if (job.urgent) this.urgentRunning++;
       const w = this.workers[slot];

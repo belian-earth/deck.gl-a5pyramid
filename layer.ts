@@ -213,6 +213,17 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
     getTileId(index: any) {
       return index ? index.i : null;
     }
+    // deck.gl aborts a loading tile that left the view only once more than
+    // maxRequests are loading, so after a pan its tiles stay queued; abort
+    // them at once, as deck.gl-raster's abortUnwantedLoads does (the pool
+    // drops a job not yet started)
+    update(...args: Parameters<Tileset2D["update"]>) {
+      const out = super.update(...args);
+      for (const tile of (this as any)._cache.values()) {
+        if (tile.isLoading && !tile.isSelected && !tile.isVisible) tile.abort();
+      }
+      return out;
+    }
     getTileMetadata(index: any) {
       let b = source.tileBox(index.i) ?? [-180, -85.05, 180, 85.05];
       // deck.gl wants west <= east; getTileIndices culls exactly
