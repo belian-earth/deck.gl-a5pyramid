@@ -10,7 +10,9 @@
 //     from binary data;
 //   - on a LOD change the new level builds undrawn and replaces the old one
 //     in the first frame that every tile it selected is loaded, or after
-//     MAX_HOLD_MS, so the map neither blanks nor draws two levels at once.
+//     MAX_HOLD_MS once at least half of them are (a5view: after MAX_HOLD_MS
+//     whatever is loaded, which blanks the map on a slow link), so the map
+//     neither blanks nor draws two levels at once.
 // Different from a5view:
 //   - the tiles of a LOD come from every open shard of its tier; shards open
 //     when a view first meets them, and a new version of the source redoes
@@ -75,6 +77,17 @@ class Swap {
   redraw: () => void = () => {};
   private queued = false;
 
+  /**
+   * Whether the pending level `lod` may replace the shown one: complete, or
+   * held for MAX_HOLD_MS with at least half its tiles loaded, never empty.
+   */
+  canShow(lod: number, now: number): boolean {
+    if (this.ready.get(lod)) return true;
+    if (now - this.pendingSince < MAX_HOLD_MS) return false;
+    const c = this.loaded.get(lod);
+    return !!c && c.selected > 0 && 2 * c.loaded >= c.selected;
+  }
+
   draws(lod: number): boolean {
     if (this.pending == null) return lod === this.shown;
     return this.ready.get(this.pending) ? lod === this.pending : lod === this.shown;
@@ -84,6 +97,7 @@ class Swap {
 
   report(lod: number, ready: boolean, counts: { selected: number; loaded: number; cells: number }, contents: PackedTile[]) {
     const was = this.ready.get(lod);
+    const before = this.loaded.get(lod)?.loaded;
     this.ready.set(lod, ready);
     this.loaded.set(lod, counts);
     this.contents.set(lod, contents);
@@ -93,9 +107,10 @@ class Swap {
       this.sink.cellsDrawn = counts.cells;
       this.sink.tiles = contents;
     }
-    // the pending level just completed: let the parent drop the old one,
-    // through a timer, not from inside deck's render pass
-    if (lod === this.pending && ready && !was) this.later();
+    // the pending level completed, or gained a tile after the hold: let the
+    // parent decide whether to drop the old one, through a timer, not from
+    // inside deck's render pass
+    if (lod === this.pending && ((ready && !was) || (counts.loaded !== before && performance.now() - this.pendingSince >= MAX_HOLD_MS))) this.later();
   }
 
   later() {
@@ -322,7 +337,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
         swap.ready.delete(lod);
         swap.hold(MAX_HOLD_MS + 32);
       }
-      if (swap.ready.get(lod) || now - swap.pendingSince >= MAX_HOLD_MS) {
+      if (swap.canShow(lod, now)) {
         swap.shown = lod;
         swap.pending = null;
         out = [this.tileLayer(lod)];
