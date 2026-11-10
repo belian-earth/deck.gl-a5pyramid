@@ -8,7 +8,7 @@ Updated 2026-11-10. Design: `docs/design.md`.
   `web/src/lib/pyramid/`) on 2026-11-10 with `git subtree split`, so the
   renderer's commits came along. Public at
   https://github.com/belian-earth/deck.gl-a5pyramid since 2026-11-10; the
-  demo installs `github:belian-earth/deck.gl-a5pyramid` (at c60e753).
+  demo installs `github:belian-earth/deck.gl-a5pyramid#v0.1.0`.
   GitHub only for now; npm once the API settles (Hugh, 2026-11-10). Licence
   Apache 2.0, as a5pyramid.
 - `npm run check`, `npm test` (28 unit tests in Node against two fixture
@@ -22,11 +22,9 @@ Updated 2026-11-10. Design: `docs/design.md`.
 
 ## Next
 
-1. A tag (v0.1.0) for the demo to pin by name rather than commit (tags
-   are Hugh's).
-2. a5view could load this package instead of its own copy of the lazy
+1. a5view could load this package instead of its own copy of the lazy
    renderer, one renderer for both.
-3. Propose to deck.gl: abort loading tiles that left the view whatever the
+2. Propose to deck.gl: abort loading tiles that left the view whatever the
    number in flight (here an override of `Tileset2D.update`).
-4. From the design notes, not yet taken: fetching apart from decoding,
+3. From the design notes, not yet taken: fetching apart from decoding,
    instanced pentagons, a tile-size sweep for 64-byte rows.
