@@ -22,7 +22,16 @@ import { boxKey } from "./tiling";
 /** A box meeting every tile. */
 export const WORLD: Box = [-180, -90, 180, 90];
 import type { WorkerRequest } from "./worker";
-import PyramidWorker from "./worker?worker";
+
+/** Makes one decode worker (worker.ts). */
+export type WorkerFactory = () => Worker;
+
+/**
+ * The bundled worker, as bundlers expect it (Vite, webpack 5, Rollup and
+ * esbuild with their worker support): a module worker from a URL relative
+ * to this file. Pass another factory to host the worker elsewhere.
+ */
+export const defaultWorker: WorkerFactory = () => new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
 
 interface ShardState {
   entry: ShardEntry;
@@ -97,9 +106,9 @@ class Pool {
   private seq = 0;
   private next = 1;
 
-  constructor(size: number) {
+  constructor(size: number, make: WorkerFactory) {
     for (let i = 0; i < size; i++) {
-      const w = new PyramidWorker();
+      const w = make();
       const slot = i;
       w.onmessage = (ev) => {
         const r = this.running.get(ev.data.id);
@@ -240,7 +249,7 @@ export class PyramidSource {
   private sizes = new Map<string, number>();
   private pool: Pool;
 
-  private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number) {
+  private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number, worker: WorkerFactory) {
     this.lods = setLods(set);
     // scalar columns by name; the vector column (an embedding), if any, apart
     this.columns = set.columns.filter((c) => c.dim == null).map((c) => c.name);
@@ -254,17 +263,22 @@ export class PyramidSource {
     this.pca = this.meta.colour === "pca";
     this.shards = set.shards.map((entry) => ({ entry, url: new URL(entry.path, base).href }));
     for (const s of this.shards) this.byPath.set(s.entry.path, s);
-    this.pool = new Pool(workers);
+    this.pool = new Pool(workers, worker);
   }
 
-  /** Open the set at `base` (a URL ending in `/`, holding set.json). */
-  static async open(base: string, opts: { workers?: number; cacheBytes?: number } = {}): Promise<PyramidSource> {
+  /**
+   * Open the set at `base` (a URL ending in `/`, holding set.json).
+   * `workers`: decode workers (default: CPUs less two, 2 to 4);
+   * `cacheBytes`: decoded tiles kept, least recently used dropped first
+   * (default 512 MB); `worker`: how to make a worker (default the bundled one).
+   */
+  static async open(base: string, opts: { workers?: number; cacheBytes?: number; worker?: WorkerFactory } = {}): Promise<PyramidSource> {
     const url = new URL(base.endsWith("/") ? base : base + "/", location.href).href;
     const res = await fetch(new URL("set.json", url));
     if (!res.ok) throw new Error(`${url}set.json: HTTP ${res.status}`);
     const set = checkSet(await res.json());
     const workers = opts.workers ?? Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 2));
-    return new PyramidSource(url, set, workers, opts.cacheBytes ?? 512 * 1024 * 1024);
+    return new PyramidSource(url, set, workers, opts.cacheBytes ?? 512 * 1024 * 1024, opts.worker ?? defaultWorker);
   }
 
   get workers() {

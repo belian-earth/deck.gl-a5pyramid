@@ -193,3 +193,67 @@ export function scores(basis: PcaBasis, codes: number[]): [number, number, numbe
   }
   return out;
 }
+
+/** What ScreenPca reads from a layer's stats (RenderStats has these). */
+export interface PcaView {
+  lod: number | null;
+  tiles: PackedTile[];
+  backdropLod: number | null;
+  backdrop: PackedTile[];
+  backdropReady: boolean;
+}
+
+/**
+ * Screen PCA for a layer: the basis of the tiles in view, and colours from
+ * it. Once the view settles, from every tile of the level shown. Until then
+ * it is provisional: a basis of the level shown stands; otherwise it comes
+ * from the backdrop (the whole view at a sixteenth of the cells) once that
+ * is complete, or from whichever level has tiles in, redone each time
+ * their number doubles. Feed it every stats change (onStats) and, for the
+ * settled view, the source's state (isSettled).
+ */
+export class ScreenPca {
+  basis: PcaBasis | null = null;
+  /** Keep the colours as they are while the view moves. */
+  locked = false;
+  private key = "";
+  private lod: number | null = null;
+  private tiles = 0;
+  private full = false;
+
+  /** Forget the basis (a new set). */
+  reset() {
+    this.basis = null;
+    this.key = "";
+    this.lod = null;
+    this.tiles = 0;
+    this.full = false;
+    this.locked = false;
+  }
+
+  /** A new colouring when the basis changes; null when it stands. */
+  update(view: PcaView, settled: boolean): (Colouring & { basis: PcaBasis }) | null {
+    if (this.locked) return null;
+    let lod = view.lod;
+    let tiles = view.tiles;
+    let full = settled;
+    if (!settled && !(this.basis && this.lod === view.lod) && view.backdrop.length && (view.backdropReady || !tiles.length)) {
+      lod = view.backdropLod;
+      tiles = view.backdrop;
+      full = view.backdropReady;
+    }
+    const n = tiles.length;
+    if (!n) return null;
+    if (!settled && this.basis && this.lod === lod && (this.full || (!full && n < 2 * this.tiles))) return null;
+    const key = `${lod}|${n}|` + tiles.map((t) => t.cells[0]).join(",");
+    if (key === this.key) return null;
+    const b = pcaBasis(tiles, this.basis);
+    if (!b) return null;
+    this.key = key;
+    this.lod = lod;
+    this.tiles = n;
+    this.full = full;
+    this.basis = b;
+    return pcaColouring(b);
+  }
+}

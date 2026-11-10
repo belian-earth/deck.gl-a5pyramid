@@ -45,6 +45,7 @@
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
 import { CodesPolygonLayer, cellKey, type Cover, type Palette } from "./codes-layer";
+import { BASE_BUDGET, DEFAULT_BUDGET, chooseLevel, type Budget } from "./budget";
 import { boxesMeet, type Box } from "./format";
 import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling";
 import type { Colouring } from "./colour";
@@ -54,21 +55,6 @@ import type { PackedTile } from "./tile-core";
 export const MAX_HOLD_MS = 1500;
 /** LODs between the level wanted and its backdrop. */
 export const BACKDROP_STEP = 2;
-
-/** The most a view may read and draw: compressed bytes and cells. */
-export interface Budget {
-  bytes: number;
-  cells: number;
-}
-
-export const DEFAULT_BUDGET: Budget = { bytes: 40e6, cells: 1.5e6 };
-
-/** What the base level may hold, over the whole set. */
-export const BASE_BUDGET: Budget = { bytes: 8e6, cells: 150e3 };
-
-/** A level on screen keeps this much over the budget before it gives way,
- * so a view near the limit does not flip between two levels as it pans. */
-const BUDGET_SLACK = 1.25;
 
 export interface CellInfo {
   cell: bigint;
@@ -105,8 +91,18 @@ export interface A5PyramidLayerProps extends LayerProps {
   cellPx?: number;
   /** The most a view reads and draws; coarser levels past it. */
   budget?: Budget;
-  /** Filled in as the layer draws: the LOD shown and its tiles. Read it on a timer. */
-  stats?: RenderStats;
+  /**
+   * Called with what the layer draws (a fresh object each time) after it
+   * changes: the levels, their tiles, the view's cost. Called outside
+   * deck.gl's render, at most once a task.
+   */
+  onStats?: (stats: RenderStats) => void;
+}
+
+/** Whether a view has settled: no level pending, every tile of the level
+ * shown loaded, and nothing in flight at the source. */
+export function isSettled(stats: RenderStats, source: PyramidSource): boolean {
+  return stats.lod != null && stats.pendingLod == null && stats.tilesSelected === stats.tilesLoaded && source.inFlight === 0;
 }
 
 export function emptyRenderStats(): RenderStats {
@@ -184,6 +180,8 @@ class Swap {
   }
 
   sink: RenderStats | null = null;
+  /** Tell the parent the stats may have changed (it batches). */
+  notify: () => void = () => {};
 
   report(lod: number, ready: boolean, counts: { selected: number; loaded: number; cells: number }, contents: PackedTile[]) {
     const was = this.ready.get(lod);
@@ -202,6 +200,7 @@ class Swap {
       this.sink.backdropReady = ready;
     }
     this.updateCovers();
+    this.notify();
     // the pending level completed, or gained a tile after the hold: let the
     // parent decide whether to drop the old one, through a timer, not from
     // inside deck's render pass
@@ -358,14 +357,40 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     datas: WeakMap<PackedTile, unknown>;
     palette: Palette;
     baseTileset: ReturnType<typeof tilesetClass> | null;
+    stats: RenderStats;
+    statsKey: string;
+    statsQueued: boolean;
   };
 
   initializeState() {
     const swap = new Swap();
     swap.redraw = () => this.setNeedsUpdate();
-    this.setState({ swap, tilesets: new Map(), datas: new WeakMap(), palette: { colouring: this.props.colouring }, baseTileset: null });
+    this.setState({
+      swap, tilesets: new Map(), datas: new WeakMap(), palette: { colouring: this.props.colouring }, baseTileset: null,
+      stats: emptyRenderStats(), statsKey: "", statsQueued: false,
+    });
+    swap.sink = this.state.stats;
+    swap.notify = () => this.queueStats();
     this.props.source.onChange = () => swap.later();
     this.loadBase(this.props.source);
+  }
+
+  /** Send the stats to onStats after this task, if they changed. */
+  private queueStats() {
+    if (this.state.statsQueued || !this.props.onStats) return;
+    this.state.statsQueued = true;
+    setTimeout(() => {
+      if (!this.state) return;
+      this.state.statsQueued = false;
+      const r = this.state.stats;
+      const key = [
+        r.lod, r.pendingLod, r.targetLod, r.capped, r.viewBytes, r.viewCells, r.tilesSelected, r.tilesLoaded, r.cellsDrawn,
+        r.backdropLod, r.backdrop.length, r.backdropReady, r.tiles.length,
+      ].join("|");
+      if (key === this.state.statsKey) return;
+      this.state.statsKey = key;
+      this.props.onStats?.({ ...r });
+    }, 0);
   }
 
   /** Find the source's base level; its layer joins once it is known. */
@@ -401,6 +426,9 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
       this.state.swap.ready.clear();
       this.state.swap.loaded.clear();
       this.state.baseTileset = null;
+      this.state.stats = emptyRenderStats();
+      this.state.statsKey = "";
+      this.state.swap.sink = this.state.stats;
       props.source.onChange = () => this.state.swap.later();
       this.loadBase(props.source);
     }
@@ -500,26 +528,22 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   private chooseLod(target: number, box: Box) {
     const { source, budget = DEFAULT_BUDGET } = this.props;
     const swap = this.state.swap;
-    let lod = target;
-    let capped: "bytes" | "cells" | null = null;
-    let cost: { rows: number; bytes: number } | null = null;
-    for (;;) {
-      void source.ensure(source.tierOf(lod), box);
-      cost = source.costIn(lod, box);
-      if (!cost) break;
-      const slack = lod === swap.shown || lod === swap.pending ? BUDGET_SLACK : 1;
-      const over = cost.bytes > budget.bytes * slack ? "bytes" : cost.rows > budget.cells * slack ? "cells" : null;
-      if (!over || lod <= source.lods[0]) break;
-      capped = over;
-      lod = pickLod(lod - 1, source.lods);
-    }
-    return { lod, capped, cost };
+    return chooseLevel(
+      target,
+      source.lods,
+      (lod) => {
+        void source.ensure(source.tierOf(lod), box);
+        return source.costIn(lod, box);
+      },
+      budget,
+      (lod) => lod === swap.shown || lod === swap.pending,
+    );
   }
 
   renderLayers(): Layer[] {
-    const { source, cellPx = 1, stats } = this.props;
+    const { source, cellPx = 1 } = this.props;
     const swap = this.state.swap;
-    swap.sink = stats ?? null;
+    const stats = this.state.stats;
     const vp = this.context.viewport;
     const box = viewportBox(vp);
     const target = pickLod(a5Resolution(vp, cellPx), source.lods);
@@ -533,12 +557,10 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     // the backdrop's shards first: its footers come before the level's
     if (swap.backdrop != null) void source.ensure(source.tierOf(swap.backdrop), box);
     void source.ensure(tier, box);
-    if (stats) {
-      stats.targetLod = target;
-      stats.capped = capped;
-      stats.viewBytes = cost?.bytes ?? null;
-      stats.viewCells = cost?.rows ?? null;
-    }
+    stats.targetLod = target;
+    stats.capped = capped;
+    stats.viewBytes = cost?.bytes ?? null;
+    stats.viewCells = cost?.rows ?? null;
 
     const now = performance.now();
     let out: Layer[];
@@ -568,19 +590,18 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     // the base level, always (kept loaded), at the bottom
     if (swap.base != null) out.unshift(this.tileLayer(swap.base, false, true));
     swap.updateCovers();
-    if (stats) {
-      stats.backdropLod = b;
-      stats.backdrop = b != null ? (swap.contents.get(b) ?? []) : [];
-      stats.backdropReady = b != null && !!swap.ready.get(b);
-      const c = swap.loaded.get(swap.shown ?? lod) ?? { selected: 0, loaded: 0, cells: 0 };
-      stats.lod = swap.shown;
-      stats.tier = source.tierOf(swap.shown ?? lod);
-      stats.pendingLod = swap.pending;
-      stats.tilesSelected = c.selected;
-      stats.tilesLoaded = c.loaded;
-      stats.cellsDrawn = c.cells;
-      stats.tiles = swap.contents.get(swap.shown ?? lod) ?? [];
-    }
+    stats.backdropLod = b;
+    stats.backdrop = b != null ? (swap.contents.get(b) ?? []) : [];
+    stats.backdropReady = b != null && !!swap.ready.get(b);
+    const c = swap.loaded.get(swap.shown ?? lod) ?? { selected: 0, loaded: 0, cells: 0 };
+    stats.lod = swap.shown;
+    stats.tier = source.tierOf(swap.shown ?? lod);
+    stats.pendingLod = swap.pending;
+    stats.tilesSelected = c.selected;
+    stats.tilesLoaded = c.loaded;
+    stats.cellsDrawn = c.cells;
+    stats.tiles = swap.contents.get(swap.shown ?? lod) ?? [];
+    this.queueStats();
     return out;
   }
 }
