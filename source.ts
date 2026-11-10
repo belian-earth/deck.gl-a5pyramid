@@ -17,6 +17,7 @@ import {
   type ShardEntry,
 } from "./format";
 import type { PackedTile } from "./tile-core";
+import { boxKey } from "./tiling";
 import type { WorkerRequest } from "./worker";
 import PyramidWorker from "./worker?worker";
 
@@ -25,6 +26,9 @@ interface ShardState {
   url: string;
   footer?: ArrayBuffer;
   index?: PyramidIndex;
+  /** Rows and compressed bytes of each tile (row group), from the footer. */
+  tileRows?: number[];
+  tileBytes?: number[];
   opening?: Promise<void>;
   failed?: string;
 }
@@ -311,6 +315,8 @@ export class PyramidSource {
           true, // a shard's index decides which tiles exist: before any tile
         ).promise;
         s.index = checkIndex(JSON.parse(out.kv.a5pyramid), out.kv.a5_index, s.entry.path);
+        s.tileRows = out.tileRows;
+        s.tileBytes = out.tileBytes;
         this.stats.shardsOpen++;
         this.version++;
         this.onChange?.();
@@ -338,6 +344,29 @@ export class PyramidSource {
     }
     return out;
   }
+
+  /**
+   * What reading `lod` for `box` costs: the rows and compressed bytes of its
+   * tiles meeting the box; null until every shard of its tier there has
+   * opened.
+   */
+  costIn(lod: number, box: Box): { rows: number; bytes: number; tiles: number } | null {
+    const key = `${lod}|${boxKey(box)}|${this.version}`;
+    const known = this.costs.get(key);
+    if (known) return known;
+    if (!this.opened(this.tierOf(lod), box)) return null;
+    let rows = 0, bytes = 0, tiles = 0;
+    for (const t of this.tilesIn(lod, box)) {
+      rows += t.shard.tileRows?.[t.tile] ?? 0;
+      bytes += t.shard.tileBytes?.[t.tile] ?? 0;
+      tiles++;
+    }
+    if (this.costs.size > 512) this.costs.clear();
+    const c = { rows, bytes, tiles };
+    this.costs.set(key, c);
+    return c;
+  }
+  private costs = new Map<string, { rows: number; bytes: number; tiles: number }>();
 
   tileBox(key: string): Box | null {
     const [path, i] = key.split("#");

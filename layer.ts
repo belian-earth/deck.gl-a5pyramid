@@ -26,7 +26,10 @@
 //     stretch, or the PCA of the view), so new colours redraw without
 //     reading, packing or uploading a tile again;
 //   - the LOD is the coarsest whose cells are at most `cellPx` CSS pixels
-//     across at the view's centre (tiling.ts), not a5view's zoom table;
+//     across at the view's centre (tiling.ts), not a5view's zoom table,
+//     made coarser while the tiles it would read for the view exceed a
+//     budget of bytes or cells (their sizes come with each shard's footer),
+//     so a view sparse in data is drawn finer than a full one;
 //   - a backdrop level, BACKDROP_STEP LODs coarser than the one wanted (a
 //     sixteenth of its cells at 2), is read ahead of every other tile and
 //     drawn under a level still loading, so a view is covered, coarsely,
@@ -35,7 +38,7 @@
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
 import { CodesPolygonLayer, type Palette } from "./codes-layer";
-import { boxesMeet } from "./format";
+import { boxesMeet, type Box } from "./format";
 import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling";
 import type { Colouring } from "./colour";
 import type { PyramidSource } from "./source";
@@ -44,6 +47,18 @@ import type { PackedTile } from "./tile-core";
 export const MAX_HOLD_MS = 1500;
 /** LODs between the level wanted and its backdrop. */
 export const BACKDROP_STEP = 2;
+
+/** The most a view may read and draw: compressed bytes and cells. */
+export interface Budget {
+  bytes: number;
+  cells: number;
+}
+
+export const DEFAULT_BUDGET: Budget = { bytes: 40e6, cells: 1.5e6 };
+
+/** A level on screen keeps this much over the budget before it gives way,
+ * so a view near the limit does not flip between two levels as it pans. */
+const BUDGET_SLACK = 1.25;
 
 export interface CellInfo {
   cell: bigint;
@@ -54,6 +69,12 @@ export interface CellInfo {
 
 export interface RenderStats {
   lod: number | null;
+  /** The level the pixel target asks for, and why a coarser one is drawn. */
+  targetLod: number | null;
+  capped: "bytes" | "cells" | null;
+  /** What the level chosen reads for the view (null until its shards open). */
+  viewBytes: number | null;
+  viewCells: number | null;
   tier: number;
   pendingLod: number | null;
   tilesSelected: number;
@@ -72,13 +93,15 @@ export interface A5PyramidLayerProps extends LayerProps {
   colouring: Colouring;
   /** Cells drawn at most this many CSS pixels across (the square root of their area). */
   cellPx?: number;
+  /** The most a view reads and draws; coarser levels past it. */
+  budget?: Budget;
   /** Filled in as the layer draws: the LOD shown and its tiles. Read it on a timer. */
   stats?: RenderStats;
 }
 
 export function emptyRenderStats(): RenderStats {
   return {
-    lod: null, tier: 0, pendingLod: null, tilesSelected: 0, tilesLoaded: 0, cellsDrawn: 0, tiles: [],
+    lod: null, targetLod: null, capped: null, viewBytes: null, viewCells: null, tier: 0, pendingLod: null, tilesSelected: 0, tilesLoaded: 0, cellsDrawn: 0, tiles: [],
     backdropLod: null, backdrop: [], backdropReady: false,
   };
 }
@@ -223,7 +246,10 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
       this.heldKey = null;
       if (key !== this.lastKey) {
         this.lastKey = key;
-        this.lastIndices = source.tilesIn(lod, box).map((t) => ({ i: t.key }));
+        // nothing until every shard of the tier in view has opened: the
+        // budget cannot judge the level before, and a level it then turns
+        // down would already be reading
+        this.lastIndices = source.opened(source.tierOf(lod), box) ? source.tilesIn(lod, box).map((t) => ({ i: t.key })) : [];
       }
       return this.lastIndices as any;
     }
@@ -263,7 +289,7 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
 
 export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   static layerName = "A5PyramidLayer";
-  static defaultProps = { cellPx: 1, pickable: true };
+  static defaultProps = { cellPx: 1, budget: DEFAULT_BUDGET, pickable: true };
 
   declare state: {
     swap: Swap;
@@ -378,19 +404,54 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     );
   }
 
+  /**
+   * The level to draw: the pixel target's, or the finest coarser one within
+   * the budget. A level whose shards are still opening is taken as it is;
+   * its layer reads nothing until they have, and the choice is made again
+   * then (the source's change redraws).
+   */
+  private chooseLod(target: number, box: Box) {
+    const { source, budget = DEFAULT_BUDGET } = this.props;
+    const swap = this.state.swap;
+    let lod = target;
+    let capped: "bytes" | "cells" | null = null;
+    let cost: { rows: number; bytes: number } | null = null;
+    for (;;) {
+      void source.ensure(source.tierOf(lod), box);
+      cost = source.costIn(lod, box);
+      if (!cost) break;
+      const slack = lod === swap.shown || lod === swap.pending ? BUDGET_SLACK : 1;
+      const over = cost.bytes > budget.bytes * slack ? "bytes" : cost.rows > budget.cells * slack ? "cells" : null;
+      if (!over || lod <= source.lods[0]) break;
+      capped = over;
+      lod = pickLod(lod - 1, source.lods);
+    }
+    return { lod, capped, cost };
+  }
+
   renderLayers(): Layer[] {
     const { source, cellPx = 1, stats } = this.props;
     const swap = this.state.swap;
     swap.sink = stats ?? null;
     const vp = this.context.viewport;
-    const lod = pickLod(a5Resolution(vp, cellPx), source.lods);
-    const tier = source.tierOf(lod);
     const box = viewportBox(vp);
+    const target = pickLod(a5Resolution(vp, cellPx), source.lods);
+    // the shards of the target's backdrop first, so a coarse view comes
+    // before any judgement of the target's cost
+    void source.ensure(source.tierOf(pickLod(target - BACKDROP_STEP, source.lods)), box);
+    const { lod, capped, cost } = this.chooseLod(target, box);
+    const tier = source.tierOf(lod);
     const back = pickLod(lod - BACKDROP_STEP, source.lods);
     swap.backdrop = back < lod ? back : null;
     // the backdrop's shards first: its footers come before the level's
     if (swap.backdrop != null) void source.ensure(source.tierOf(swap.backdrop), box);
     void source.ensure(tier, box);
+    if (stats) {
+      stats.targetLod = target;
+      stats.capped = capped;
+      stats.viewBytes = cost?.bytes ?? null;
+      stats.viewCells = cost?.rows ?? null;
+    }
 
     const now = performance.now();
     let out: Layer[];

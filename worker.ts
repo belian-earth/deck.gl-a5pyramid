@@ -17,7 +17,10 @@ ctx.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
   try {
     if (m.type === "index") {
       const md = openShard(m.url, m.bytes, m.footer);
-      ctx.postMessage({ id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length });
+      // each tile's rows and compressed bytes, for the view budget
+      const tileRows = md.row_groups.map((rg) => Number(rg.num_rows));
+      const tileBytes = md.row_groups.map((rg) => rg.columns.reduce((a, c) => a + Number(c.meta_data?.total_compressed_size ?? 0), 0));
+      ctx.postMessage({ id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes });
       return;
     }
     if (!hasShard(m.url)) {
