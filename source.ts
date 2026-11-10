@@ -18,6 +18,9 @@ import {
 } from "./format";
 import type { PackedTile } from "./tile-core";
 import { boxKey } from "./tiling";
+
+/** A box meeting every tile. */
+export const WORLD: Box = [-180, -90, 180, 90];
 import type { WorkerRequest } from "./worker";
 import PyramidWorker from "./worker?worker";
 
@@ -343,6 +346,22 @@ export class PyramidSource {
       }
     }
     return out;
+  }
+
+  /**
+   * The base level: the finest level of the coarsest tier whose tiles over
+   * the whole set are within `budget`, or null when even its coarsest is
+   * not. Opens every shard of that tier (a few small footers).
+   */
+  async baseLevel(budget: { cells: number; bytes: number }): Promise<number | null> {
+    await this.ensure(0, WORLD);
+    const tier = this.set.tiers[0];
+    if (!tier) return null;
+    for (let lod = tier.lods[1]; lod >= tier.lods[0]; lod--) {
+      const c = this.costIn(lod, WORLD);
+      if (c && c.rows > 0 && c.rows <= budget.cells && c.bytes <= budget.bytes) return lod;
+    }
+    return null;
   }
 
   /**

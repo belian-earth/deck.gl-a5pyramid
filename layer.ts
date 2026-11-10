@@ -33,7 +33,11 @@
 //   - a backdrop level, BACKDROP_STEP LODs coarser than the one wanted (a
 //     sixteenth of its cells at 2), is read ahead of every other tile and
 //     drawn under a level still loading, so a view is covered, coarsely,
-//     after one or two small reads.
+//     after one or two small reads;
+//   - a base level, the finest whose tiles over the whole set fit
+//     BASE_BUDGET (LOD 12 for Sabah: 38 k cells, under 3 MB of the 64-band
+//     set), is read once when the set opens, kept, and drawn under the rest
+//     while they load, so a jump to any part of the set shows it at once.
 
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
@@ -41,7 +45,7 @@ import { CodesPolygonLayer, type Palette } from "./codes-layer";
 import { boxesMeet, type Box } from "./format";
 import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling";
 import type { Colouring } from "./colour";
-import type { PyramidSource } from "./source";
+import { WORLD, type PyramidSource } from "./source";
 import type { PackedTile } from "./tile-core";
 
 export const MAX_HOLD_MS = 1500;
@@ -55,6 +59,9 @@ export interface Budget {
 }
 
 export const DEFAULT_BUDGET: Budget = { bytes: 40e6, cells: 1.5e6 };
+
+/** What the base level may hold, over the whole set. */
+export const BASE_BUDGET: Budget = { bytes: 8e6, cells: 150e3 };
 
 /** A level on screen keeps this much over the budget before it gives way,
  * so a view near the limit does not flip between two levels as it pans. */
@@ -111,6 +118,7 @@ class Swap {
   shown: number | null = null;
   pending: number | null = null;
   backdrop: number | null = null;
+  base: number | null = null;
   pendingSince = 0;
   ready = new Map<number, boolean>();
   loaded = new Map<number, { selected: number; loaded: number; cells: number }>();
@@ -134,6 +142,12 @@ class Swap {
     if (lod === top) return true;
     // the backdrop, under a level still loading
     return lod === this.backdrop && top != null && !this.ready.get(top);
+  }
+
+  /** The base level is drawn under a finer level still loading. */
+  drawsBase(): boolean {
+    const top = this.pending != null && this.ready.get(this.pending) ? this.pending : this.shown;
+    return this.base != null && top != null && top > this.base && !this.ready.get(top);
   }
 
   sink: RenderStats | null = null;
@@ -176,6 +190,8 @@ class Swap {
 }
 
 interface PyramidTileLayerProps {
+  /** "base": the base level's layer, which neither reports nor holds. */
+  role?: "base";
   lod: number;
   tier: number;
   swap: Swap;
@@ -204,7 +220,8 @@ class PyramidTileLayer extends TileLayer<PackedTile, PyramidTileLayerProps> {
     }
     // complete once every tile selected has loaded and every shard of the
     // tier in view has opened (before that a level selects too few tiles)
-    const { source, tier, lod, swap } = this.props;
+    const { source, tier, lod, swap, role } = this.props;
+    if (role === "base") return out;
     const opened = source.opened(tier, viewportBox(this.context.viewport));
     // (the tiles' own flags: the layer's isLoaded also waits for sublayers
     // made in this very pass, so a level's last tile would never count)
@@ -213,11 +230,12 @@ class PyramidTileLayer extends TileLayer<PackedTile, PyramidTileLayerProps> {
   }
 
   filterSubLayer(context: Parameters<TileLayer["filterSubLayer"]>[0]) {
-    return this.props.swap.draws(this.props.lod) && super.filterSubLayer(context);
+    const { swap, lod, role } = this.props;
+    return (role === "base" ? swap.drawsBase() : swap.draws(lod)) && super.filterSubLayer(context);
   }
 }
 
-function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
+function tilesetClass(source: PyramidSource, lod: number, swap: Swap, all = false) {
   return class extends Tileset2D {
     private lastKey: string | null = null;
     private lastIndices: { i: string }[] = [];
@@ -226,6 +244,15 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
     private heldIndices: { i: string }[] = [];
 
     getTileIndices(opts: { viewport: any }) {
+      // the base level: every tile, wherever the view is
+      if (all) {
+        const key = `all|${source.version}`;
+        if (key !== this.lastKey) {
+          this.lastKey = key;
+          this.lastIndices = source.tilesIn(lod, WORLD).map((t) => ({ i: t.key }));
+        }
+        return this.lastIndices as any;
+      }
       const box = viewportBox(opts.viewport);
       const key = boxKey(box) + "|" + source.version;
       // a level held on screen while another loads adds no tiles: it would
@@ -296,13 +323,29 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     tilesets: Map<number, ReturnType<typeof tilesetClass>>;
     datas: WeakMap<PackedTile, unknown>;
     palette: Palette;
+    baseTileset: ReturnType<typeof tilesetClass> | null;
   };
 
   initializeState() {
     const swap = new Swap();
     swap.redraw = () => this.setNeedsUpdate();
-    this.setState({ swap, tilesets: new Map(), datas: new WeakMap(), palette: { colouring: this.props.colouring } });
+    this.setState({ swap, tilesets: new Map(), datas: new WeakMap(), palette: { colouring: this.props.colouring }, baseTileset: null });
     this.props.source.onChange = () => swap.later();
+    this.loadBase(this.props.source);
+  }
+
+  /** Find the source's base level; its layer joins once it is known. */
+  private loadBase(source: PyramidSource) {
+    const swap = this.state.swap;
+    swap.base = null;
+    source.baseLevel(BASE_BUDGET).then(
+      (lod) => {
+        if (this.props.source !== source) return;
+        swap.base = lod;
+        swap.later();
+      },
+      () => {},
+    );
   }
 
   shouldUpdateState({ changeFlags }: UpdateParameters<this>) {
@@ -323,7 +366,9 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
       this.state.swap.contents.clear();
       this.state.swap.ready.clear();
       this.state.swap.loaded.clear();
+      this.state.baseTileset = null;
       props.source.onChange = () => this.state.swap.later();
+      this.loadBase(props.source);
     }
   }
 
@@ -351,20 +396,26 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     return cls;
   }
 
-  private tileLayer(lod: number, urgent = false) {
+  private tileLayer(lod: number, urgent = false, base = false) {
     const { source, opacity, pickable } = this.props;
     const { datas, palette } = this.state;
+    let TilesetClass = this.tileset(lod);
+    if (base) {
+      this.state.baseTileset ??= tilesetClass(source, lod, this.state.swap, true);
+      TilesetClass = this.state.baseTileset;
+    }
     return new PyramidTileLayer(
       this.getSubLayerProps({
         // per source: deck keeps a TileLayer's tileset across prop changes,
         // so a new source needs new layers, not new props
-        id: `s${source.id}-lod${lod}`,
+        id: base ? `s${source.id}-base${lod}` : `s${source.id}-lod${lod}`,
+        role: base ? "base" : undefined,
         lod,
         tier: source.tierOf(lod),
         source,
         swap: this.state.swap,
         version: source.version,
-        TilesetClass: this.tileset(lod),
+        TilesetClass,
         extent: [-180, -85.05, 180, 85.05],
         refinementStrategy: "never",
         // the pool queues and cancels requests; deck holds new ones back
@@ -478,6 +529,8 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     // ready for the next move; the level shown may be it (after a zoom in)
     const b = swap.backdrop;
     if (b != null && b !== swap.shown && b !== swap.pending) out.unshift(this.tileLayer(b, true));
+    // the base level, always (kept loaded), at the bottom
+    if (swap.base != null) out.unshift(this.tileLayer(swap.base, false, true));
     if (stats) {
       stats.backdropLod = b;
       stats.backdrop = b != null ? (swap.contents.get(b) ?? []) : [];
