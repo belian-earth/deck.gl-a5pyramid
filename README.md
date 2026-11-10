@@ -136,12 +136,6 @@ npm run build          # dist/
 
 ## Acknowledgements
 
-- **[a5view](https://github.com/belian-earth/a5view)** (Belian). This
-  renderer began as a port of a5view's lazy renderer
-  (`inst/htmlwidgets/lib/a5view-tiling`): a TileLayer for each level, its
-  tiles atomic rather than quadtree children, SolidPolygonLayer over binary
-  attributes, the old level held on screen until the new one is in, and the
-  padded view boxes.
 - **[deck.gl-raster](https://github.com/developmentseed/deck.gl-raster)**
   (Development Seed), read at commit 6da743d for what makes it fast. Its
   approaches, not its code, are behind: colouring on the GPU from codes
@@ -152,11 +146,8 @@ npm run build          # dist/
   coalescing gains nothing at about 1 MB a tile.
 - **[A5](https://github.com/felixpalmer/a5)** (Felix Palmer), through
   a5-js. Its cells are equal-area, which makes the pixel rule exact, and its
-  ids follow a space-filling curve, so a run of consecutive ids is a compact
-  patch: a5pyramid's tiles are such runs, and the base level's mask relies
-  on it.
-- **[a5pyramid](https://github.com/belian-earth/a5pyramid)** (Belian): the
-  set format and its writer.
+  ids follow a space-filling curve, so a tile, a run of consecutive ids, is
+  a compact patch, which the base level's mask relies on.
 - **[hyparquet](https://github.com/hyparam/hyparquet)** (Hyperparam):
   Parquet read in the browser, a row group at a time, over range requests.
 - **[deck.gl](https://deck.gl) and [luma.gl](https://luma.gl)** (vis.gl,
