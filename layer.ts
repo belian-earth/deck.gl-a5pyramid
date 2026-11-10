@@ -23,7 +23,11 @@
 //     earcut, its largest per-tile cost in a5view;
 //   - colours come from the stored codes on the main thread through a
 //     Colouring (a band stretch, or the PCA of the view), so new colours
-//     apply to tiles without reading them again.
+//     apply to tiles without reading them again;
+//   - a backdrop level, BACKDROP_STEP LODs coarser than the one wanted (a
+//     sixteenth of its cells at 2), is read ahead of every other tile and
+//     drawn under a level still loading, so a view is covered, coarsely,
+//     after one or two small reads.
 
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
@@ -34,6 +38,8 @@ import type { PyramidSource } from "./source";
 import type { PackedTile } from "./tile-core";
 
 export const MAX_HOLD_MS = 1500;
+/** LODs between the level wanted and its backdrop. */
+export const BACKDROP_STEP = 2;
 
 export interface CellInfo {
   cell: bigint;
@@ -51,6 +57,10 @@ export interface RenderStats {
   cellsDrawn: number;
   /** The loaded tiles of the LOD shown, in view. */
   tiles: PackedTile[];
+  /** The backdrop level, its loaded tiles in view, and whether it is complete. */
+  backdropLod: number | null;
+  backdrop: PackedTile[];
+  backdropReady: boolean;
 }
 
 export interface A5PyramidLayerProps extends LayerProps {
@@ -63,13 +73,17 @@ export interface A5PyramidLayerProps extends LayerProps {
 }
 
 export function emptyRenderStats(): RenderStats {
-  return { lod: null, tier: 0, pendingLod: null, tilesSelected: 0, tilesLoaded: 0, cellsDrawn: 0, tiles: [] };
+  return {
+    lod: null, tier: 0, pendingLod: null, tilesSelected: 0, tilesLoaded: 0, cellsDrawn: 0, tiles: [],
+    backdropLod: null, backdrop: [], backdropReady: false,
+  };
 }
 
 /** Shared by the parent and its TileLayers: which LOD is drawn. */
 class Swap {
   shown: number | null = null;
   pending: number | null = null;
+  backdrop: number | null = null;
   pendingSince = 0;
   ready = new Map<number, boolean>();
   loaded = new Map<number, { selected: number; loaded: number; cells: number }>();
@@ -89,8 +103,10 @@ class Swap {
   }
 
   draws(lod: number): boolean {
-    if (this.pending == null) return lod === this.shown;
-    return this.ready.get(this.pending) ? lod === this.pending : lod === this.shown;
+    const top = this.pending != null && this.ready.get(this.pending) ? this.pending : this.shown;
+    if (lod === top) return true;
+    // the backdrop, under a level still loading
+    return lod === this.backdrop && top != null && !this.ready.get(top);
   }
 
   sink: RenderStats | null = null;
@@ -106,6 +122,10 @@ class Swap {
       this.sink.tilesLoaded = counts.loaded;
       this.sink.cellsDrawn = counts.cells;
       this.sink.tiles = contents;
+    }
+    if (this.sink && lod === this.backdrop) {
+      this.sink.backdrop = contents;
+      this.sink.backdropReady = ready;
     }
     // the pending level completed, or gained a tile after the hold: let the
     // parent decide whether to drop the old one, through a timer, not from
@@ -159,7 +179,9 @@ class PyramidTileLayer extends TileLayer<PackedTile, PyramidTileLayerProps> {
     // tier in view has opened (before that a level selects too few tiles)
     const { source, tier, lod, swap } = this.props;
     const opened = source.opened(tier, viewportBox(this.context.viewport));
-    swap.report(lod, opened && this.isLoaded, { selected: tiles.length, loaded, cells }, contents);
+    // (the tiles' own flags: the layer's isLoaded also waits for sublayers
+    // made in this very pass, so a level's last tile would never count)
+    swap.report(lod, opened && !!this.state.tileset && loaded === tiles.length, { selected: tiles.length, loaded, cells }, contents);
     return out;
   }
 
@@ -168,12 +190,18 @@ class PyramidTileLayer extends TileLayer<PackedTile, PyramidTileLayerProps> {
   }
 }
 
-function tilesetClass(source: PyramidSource, lod: number) {
+function tilesetClass(source: PyramidSource, lod: number, swap: Swap) {
   return class extends Tileset2D {
     private lastKey: string | null = null;
     private lastIndices: { i: string }[] = [];
 
     getTileIndices(opts: { viewport: any }) {
+      // a level held on screen while another loads keeps the tiles it has:
+      // it would otherwise read tiles for a view it will not be shown in
+      // (after a zoom out, a hundred of them)
+      if (this.lastKey != null && swap.pending != null && lod !== swap.pending && lod !== swap.backdrop) {
+        return this.lastIndices as any;
+      }
       const box = viewportBox(opts.viewport);
       const key = boxKey(box) + "|" + source.version;
       if (key !== this.lastKey) {
@@ -231,7 +259,10 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
       this.state.tilesets.clear();
       this.state.swap.shown = null;
       this.state.swap.pending = null;
+      this.state.swap.backdrop = null;
       this.state.swap.contents.clear();
+      this.state.swap.ready.clear();
+      this.state.swap.loaded.clear();
       props.source.onChange = () => this.state.swap.later();
     }
   }
@@ -254,13 +285,13 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
   private tileset(lod: number) {
     let cls = this.state.tilesets.get(lod);
     if (!cls) {
-      cls = tilesetClass(this.props.source, lod);
+      cls = tilesetClass(this.props.source, lod, this.state.swap);
       this.state.tilesets.set(lod, cls);
     }
     return cls;
   }
 
-  private tileLayer(lod: number) {
+  private tileLayer(lod: number, urgent = false) {
     const { source, colouring, opacity, pickable } = this.props;
     const datas = this.state.datas;
     return new PyramidTileLayer(
@@ -285,7 +316,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
         pickable,
         opacity,
         updateTriggers: { renderSubLayers: colouring.version },
-        getTileData: (tile: any) => source.tile(tile.index.i, lod, tile.signal),
+        getTileData: (tile: any) => source.tile(tile.index.i, lod, tile.signal, urgent),
         renderSubLayers: (p: any) => {
           const t = p.data as PackedTile | null;
           if (!t || t.n === 0) return null;
@@ -322,7 +353,12 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     const vp = this.context.viewport;
     const lod = pickLod(a5Resolution(vp, lodBias), source.lods);
     const tier = source.tierOf(lod);
-    void source.ensure(tier, viewportBox(vp));
+    const box = viewportBox(vp);
+    const back = pickLod(lod - BACKDROP_STEP, source.lods);
+    swap.backdrop = back < lod ? back : null;
+    // the backdrop's shards first: its footers come before the level's
+    if (swap.backdrop != null) void source.ensure(source.tierOf(swap.backdrop), box);
+    void source.ensure(tier, box);
 
     const now = performance.now();
     let out: Layer[];
@@ -345,7 +381,14 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
         out = [this.tileLayer(swap.shown), this.tileLayer(lod)];
       }
     }
+    // the backdrop's layer stays while it is one, drawn or not, so it is
+    // ready for the next move; the level shown may be it (after a zoom in)
+    const b = swap.backdrop;
+    if (b != null && b !== swap.shown && b !== swap.pending) out.unshift(this.tileLayer(b, true));
     if (stats) {
+      stats.backdropLod = b;
+      stats.backdrop = b != null ? (swap.contents.get(b) ?? []) : [];
+      stats.backdropReady = b != null && !!swap.ready.get(b);
       const c = swap.loaded.get(swap.shown ?? lod) ?? { selected: 0, loaded: 0, cells: 0 };
       stats.lod = swap.shown;
       stats.tier = source.tierOf(swap.shown ?? lod);

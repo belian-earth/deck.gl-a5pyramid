@@ -60,19 +60,25 @@ interface Job {
   /** Tile layers waiting on it; it is dropped when the last one gives up. */
   waiters: number;
   started: boolean;
+  /** Read before any other job (the backdrop level's tiles). */
+  urgent: boolean;
 }
 
 /**
  * Workers fed from one queue on the main thread, at most PER_WORKER requests
  * each at a time, newest first: the latest view's tiles are read before the
  * ones a camera move passed through, and those not yet started are dropped
- * once deck.gl no longer wants them.
+ * once deck.gl no longer wants them. Urgent jobs (the backdrop level's tiles)
+ * go first, and nothing else starts while one is queued or running, so on a
+ * slow link they have the bandwidth to themselves.
  */
 class Pool {
   static PER_WORKER = 2;
   private workers: { w: Worker; busy: number; shards: Set<string> }[] = [];
   private running = new Map<number, { job: Job; slot: number }>();
   private queue: Job[] = [];
+  private urgent: Job[] = [];
+  private urgentRunning = 0;
   private next = 1;
 
   constructor(size: number) {
@@ -84,6 +90,7 @@ class Pool {
         if (!r) return;
         this.running.delete(ev.data.id);
         this.workers[slot].busy--;
+        if (r.job.urgent) this.urgentRunning--;
         if (ev.data.error) r.job.reject(new Error(ev.data.error));
         else r.job.resolve(ev.data);
         this.pump();
@@ -98,51 +105,55 @@ class Pool {
 
   /** Requests queued or running. */
   get inFlight() {
-    return this.queue.length + this.running.size;
+    return this.queue.length + this.urgent.length + this.running.size;
   }
 
   get queued() {
-    return this.queue.length;
+    return this.queue.length + this.urgent.length;
   }
 
-  submit(build: Job["build"], shard: string): { job: Job; promise: Promise<any> } {
+  submit(build: Job["build"], shard: string, urgent = false): { job: Job; promise: Promise<any> } {
     let job!: Job;
     const promise = new Promise<any>((resolve, reject) => {
-      job = { build, shard, resolve, reject, waiters: 1, started: false };
+      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent };
     });
-    this.queue.push(job);
+    (urgent ? this.urgent : this.queue).push(job);
     this.pump();
     return { job, promise };
   }
 
-  /** Move a queued job to the front of the line (the end of the queue). */
-  bump(job: Job) {
+  /** Move a queued job to the front of its line (the end), or into the urgent one. */
+  bump(job: Job, urgent = false) {
     if (job.started) return;
-    const i = this.queue.indexOf(job);
-    if (i >= 0 && i !== this.queue.length - 1) {
-      this.queue.splice(i, 1);
-      this.queue.push(job);
-    }
+    const from = job.urgent ? this.urgent : this.queue;
+    const i = from.indexOf(job);
+    if (i < 0) return;
+    from.splice(i, 1);
+    job.urgent ||= urgent;
+    (job.urgent ? this.urgent : this.queue).push(job);
+    this.pump();
   }
 
   /** Drop a job not yet started. */
   cancel(job: Job): boolean {
     if (job.started) return false;
-    const i = this.queue.indexOf(job);
-    if (i >= 0) this.queue.splice(i, 1);
+    const line = job.urgent ? this.urgent : this.queue;
+    const i = line.indexOf(job);
+    if (i >= 0) line.splice(i, 1);
     job.reject(new DOMException("tile no longer needed", "AbortError"));
     return true;
   }
 
   private pump() {
-    while (this.queue.length) {
+    while (this.urgent.length || (this.queue.length && !this.urgentRunning)) {
       let slot = -1;
       for (let i = 0; i < this.workers.length; i++) {
         if (this.workers[i].busy < Pool.PER_WORKER && (slot < 0 || this.workers[i].busy < this.workers[slot].busy)) slot = i;
       }
       if (slot < 0) return;
-      const job = this.queue.pop()!;
+      const job = (this.urgent.length ? this.urgent : this.queue).pop()!;
       job.started = true;
+      if (job.urgent) this.urgentRunning++;
       const w = this.workers[slot];
       const id = this.next++;
       const needsFooter = !w.shards.has(job.shard);
@@ -156,7 +167,7 @@ class Pool {
   terminate() {
     for (const { w } of this.workers) w.terminate();
     for (const { job } of this.running.values()) job.reject(new Error("pyramid closed"));
-    for (const job of this.queue) job.reject(new Error("pyramid closed"));
+    for (const job of [...this.queue, ...this.urgent]) job.reject(new Error("pyramid closed"));
     this.running.clear();
     this.queue = [];
   }
@@ -265,6 +276,7 @@ export class PyramidSource {
         const out = await this.pool.submit(
           (id) => ({ id, type: "index", url: s.url, bytes, footer: footer.slice(0) }),
           s.url,
+          true, // a shard's index decides which tiles exist: before any tile
         ).promise;
         s.index = checkIndex(JSON.parse(out.kv.a5pyramid), out.kv.a5_index, s.entry.path);
         this.stats.shardsOpen++;
@@ -303,9 +315,10 @@ export class PyramidSource {
 
   /**
    * The packed tile `key` (`<path>#<tile>`), decoded once and cached. A tile
-   * still queued when every caller's `signal` has aborted is dropped.
+   * still queued when every caller's `signal` has aborted is dropped; an
+   * `urgent` one is read before any other.
    */
-  tile(key: string, lod: number, signal?: AbortSignal): Promise<PackedTile> {
+  tile(key: string, lod: number, signal?: AbortSignal, urgent = false): Promise<PackedTile> {
     const hit = this.cache.get(key);
     if (hit) {
       // most recently used last
@@ -314,7 +327,7 @@ export class PyramidSource {
       const job = this.jobs.get(key);
       if (job) {
         job.waiters++;
-        this.pool.bump(job);
+        this.pool.bump(job, urgent);
         this.watch(key, job, signal);
       }
       return hit;
@@ -329,6 +342,7 @@ export class PyramidSource {
         tile: Number(i), lod, columns: this.columns, stats: this.pca, vector: this.vector,
       }),
       s.url,
+      urgent,
     );
     const p = promise.then((out) => {
       const t = out.tile as PackedTile;
