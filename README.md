@@ -1,10 +1,14 @@
 # deck.gl-a5pyramid
 
-Draw [a5pyramid](https://github.com/belian-earth/a5pyramid) sets in
-[deck.gl](https://deck.gl): pentagonal [A5](https://github.com/felixpalmer/a5) cells at many
-levels of detail, stored as Parquet and read straight from static storage
-(S3, a CDN, any server with byte ranges) with HTTP range requests. No tile
-server.
+A [deck.gl](https://deck.gl) layer that streams
+[A5](https://github.com/felixpalmer/a5) pyramids straight from Parquet: it
+reads only the tiles a view needs, at the detail the screen can show, and
+colours them on the GPU. No tile server: an
+[a5pyramid](https://github.com/belian-earth/a5pyramid) set on static storage
+(S3, a CDN, any server with byte ranges) is read with HTTP range requests.
+It is to A5 pyramids roughly what
+[deck.gl-raster](https://github.com/developmentseed/deck.gl-raster) is to
+Cloud-Optimized GeoTIFFs.
 
 - **Coloured on the GPU.** Each tile's codes go to the GPU once; a colouring
   (a band stretch, or the principal components of the cells in view) is a

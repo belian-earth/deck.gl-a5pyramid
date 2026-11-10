@@ -1,7 +1,7 @@
 {
   "name": "deck.gl-a5pyramid",
   "version": "0.1.0",
-  "description": "Draw a5pyramid sets (A5 cells in Parquet, read with HTTP range requests) in deck.gl, coloured on the GPU",
+  "description": "Stream A5 cell pyramids from Parquet into deck.gl, coloured on the GPU, with no tile server",
   "license": "Apache-2.0",
   "author": "Belian (https://belian.earth)",
   "repository": {
