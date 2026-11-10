@@ -38,13 +38,13 @@
 //     BASE_BUDGET (LOD 12 for Sabah: 38 k cells, under 3 MB of the 64-band
 //     set), is read once when the set opens, kept, and drawn under the rest
 //     while they load, so a jump to any part of the set shows it at once;
-//   - the backdrop and the base are drawn only where the levels above have
-//     no loaded tile (a Cover, codes-layer.ts), so their large cells fill
-//     gaps without standing out past a coast.
+//   - the base is drawn only where the levels above have no loaded tile (a
+//     Cover of their id runs, codes-layer.ts), so its large cells fill gaps
+//     without standing out past a coast.
 
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
-import { CodesPolygonLayer, type Cover, type Palette } from "./codes-layer";
+import { CodesPolygonLayer, cellKey, type Cover, type Palette } from "./codes-layer";
 import { boxesMeet, type Box } from "./format";
 import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling";
 import type { Colouring } from "./colour";
@@ -116,24 +116,6 @@ export function emptyRenderStats(): RenderStats {
   };
 }
 
-/** A loaded tile's extent, from its vertices (kept per tile). */
-const bounds = new WeakMap<PackedTile, Box>();
-function tileBounds(t: PackedTile): Box {
-  let b = bounds.get(t);
-  if (!b) {
-    let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
-    const p = t.positions;
-    for (let i = 0; i < p.length; i += 2) {
-      if (p[i] < w) w = p[i];
-      if (p[i] > e) e = p[i];
-      if (p[i + 1] < s) s = p[i + 1];
-      if (p[i + 1] > n) n = p[i + 1];
-    }
-    b = [w, s, e, n];
-    bounds.set(t, b);
-  }
-  return b;
-}
 const tileIds = new WeakMap<PackedTile, number>();
 let nextTileId = 1;
 function tileId(t: PackedTile): number {
@@ -173,29 +155,25 @@ class Swap {
     return lod === this.backdrop && top != null && !this.ready.get(top);
   }
 
-  /** What hides the backdrop's cells (the loaded tiles of the levels above
-   * it) and the base's (those and the backdrop's); changed in place. */
-  backdropCover: Cover = { version: 0, boxes: [] };
-  baseCover: Cover = { version: 0, boxes: [] };
+  /** What hides the base's cells: the loaded runs of the levels drawn
+   * above it; changed in place. */
+  baseCover: Cover = { version: 0, runs: new Map() };
   private coverKey = "";
-
-  /** The cover for a layer of `lod` now: the backdrop's while it is one. */
-  coverFor(lod: number): Cover | null {
-    return lod === this.backdrop && lod !== this.shown && lod !== this.pending ? this.backdropCover : null;
-  }
 
   updateCovers() {
     const top = this.pending != null && this.ready.get(this.pending) ? this.pending : null;
-    const above = [this.shown, top].filter((l): l is number => l != null && l !== this.backdrop);
-    const back = this.backdrop != null && !above.includes(this.backdrop) ? [this.backdrop] : [];
-    const ids = (lods: number[]) => lods.map((l) => `${l}:` + (this.contents.get(l) ?? []).map(tileId).join(",")).join("|");
-    const key = ids(above) + "#" + ids(back);
+    const lods = [...new Set([this.shown, top, this.backdrop])].filter((l): l is number => l != null && (this.base == null || l > this.base));
+    const key = lods.map((l) => `${l}:` + (this.contents.get(l) ?? []).map(tileId).join(",")).join("|");
     if (key === this.coverKey) return;
     this.coverKey = key;
-    const boxes = (lods: number[]) => lods.flatMap((l) => (this.contents.get(l) ?? []).map(tileBounds));
-    this.backdropCover.boxes = boxes(above);
-    this.backdropCover.version++;
-    this.baseCover.boxes = [...this.backdropCover.boxes, ...boxes(back)];
+    const runs = new Map<number, Float64Array>();
+    for (const l of lods) {
+      const ts = this.contents.get(l) ?? [];
+      if (!ts.length) continue;
+      const pairs = ts.map((t) => [cellKey(t.cells[0]), cellKey(t.cells[t.n - 1])]).sort((a, b) => a[0] - b[0]);
+      runs.set(l, Float64Array.from(pairs.flat()));
+    }
+    this.baseCover.runs = runs;
     this.baseCover.version++;
   }
 
@@ -499,7 +477,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
             data: data as any,
             packed: t,
             palette,
-            cover: base ? () => swap.baseCover : () => swap.coverFor(lod),
+            cover: base ? () => swap.baseCover : undefined,
             _normalize: false,
             _windingOrder: "CCW",
             positionFormat: "XY",

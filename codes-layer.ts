@@ -9,12 +9,17 @@
 // channel's weights. A new colouring changes the uniforms and redraws; the
 // geometry and the codes stay on the GPU as they are.
 //
-// A coarser level drawn under a finer one still loading (the backdrop, the
-// base) can take a Cover: the boxes of the finer level's loaded tiles. Its
-// cells whose centres lie in one are not drawn (a mask texture, a byte a
-// cell, made again when the cover changes), so it fills only where nothing
-// finer has arrived; drawn whole, its large cells stood out past the coast,
-// over sea the finer cells leave empty.
+// The base level, drawn under finer levels still loading, takes a Cover:
+// the id runs of the finer levels' loaded tiles (a tile is a run of
+// consecutive cell ids, sea between its cells included). A base cell is not
+// drawn when the finer cell at its centre falls in a loaded run, since the
+// finer level then has its data there or knows there is none (a mask
+// texture, a byte a cell). Drawn whole, its 1.4 km cells stood out past the
+// coast, over sea the finer cells leave empty; masked by the tiles' boxes
+// instead, it left gaps where a box reached over tiles not yet loaded.
+// The finer cell at a centre is an a5-js lookup (about 3.5 us), made only
+// for cells in view, kept per level, and at most LOOKUPS_PER_FRAME a frame:
+// a cell not yet looked up stays drawn.
 //
 // As deck.gl-raster colours its rasters (a texture of codes, the rendering
 // in a shader module), with the work per vertex rather than per pixel: a
@@ -26,17 +31,39 @@ import { SolidPolygonLayer } from "@deck.gl/layers";
 import type { Texture } from "@luma.gl/core";
 import type { ShaderModule } from "@luma.gl/shadertools";
 import { WEIGHT_VEC4S, type Colouring } from "./colour";
+import { lonLatToCell } from "a5-js";
 import type { Box } from "./format";
+import { boxKey, viewportBox } from "./tiling";
 import { MAX_INPUTS, type PackedTile } from "./tile-core";
 
 const ROW = MAX_INPUTS / 4;
 /** Cells a row of a mask texture (one byte each). */
 const MASK_WIDTH = 2048;
 
-/** Boxes of the finer level's loaded tiles; `version` changes with them. */
+/** The finer levels' loaded runs; `version` changes with them. */
 export interface Cover {
   version: number;
-  boxes: Box[];
+  /** Per level: sorted [lo, hi] pairs of cellKey()s, a loaded tile each. */
+  runs: Map<number, Float64Array>;
+}
+
+/** A cell id as an ordered number: exact for cells to resolution 25 or so,
+ * whose lowest 11 bits are zero. */
+export function cellKey(id: bigint): number {
+  return Number(id >> 11n);
+}
+
+function inRuns(runs: Float64Array, k: number): boolean {
+  // the last pair starting at or before k
+  let lo = 0, hi = runs.length / 2 - 1, at = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (runs[2 * mid] <= k) {
+      at = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return at >= 0 && k <= runs[2 * at + 1];
 }
 
 function inBox(lon: number, lat: number, b: Box): boolean {
@@ -44,40 +71,15 @@ function inBox(lon: number, lat: number, b: Box): boolean {
   return b[0] <= b[2] ? lon >= b[0] && lon <= b[2] : lon >= b[0] || lon <= b[2];
 }
 
-/** A cover's boxes bucketed on a GRID x GRID grid over their extent, so a
- * point is tested against the few boxes near it; built once per version. */
-const GRID = 32;
-interface CoverGrid { version: number; w: number; s: number; dx: number; dy: number; cells: Box[][]; wide: Box[] }
-const grids = new WeakMap<Cover, CoverGrid>();
-function coverGrid(cv: Cover): CoverGrid {
-  const known = grids.get(cv);
-  if (known && known.version === cv.version) return known;
-  // boxes across the antimeridian are tested for every point
-  const wide = cv.boxes.filter((b) => b[0] > b[2]);
-  const flat = cv.boxes.filter((b) => b[0] <= b[2]);
-  let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
-  for (const b of flat) {
-    w = Math.min(w, b[0]); s = Math.min(s, b[1]); e = Math.max(e, b[2]); n = Math.max(n, b[3]);
+const LOOKUPS_PER_FRAME = 1500;
+const lookups = { at: -Infinity, left: 0 };
+function takeLookup(): boolean {
+  const now = performance.now();
+  if (now - lookups.at > 12) {
+    lookups.at = now;
+    lookups.left = LOOKUPS_PER_FRAME;
   }
-  const dx = (e - w) / GRID || 1, dy = (n - s) / GRID || 1;
-  const cells: Box[][] = Array.from({ length: GRID * GRID }, () => []);
-  const clamp = (k: number) => Math.max(0, Math.min(GRID - 1, k));
-  for (const b of flat) {
-    for (let gy = clamp(Math.floor((b[1] - s) / dy)); gy <= clamp(Math.floor((b[3] - s) / dy)); gy++) {
-      for (let gx = clamp(Math.floor((b[0] - w) / dx)); gx <= clamp(Math.floor((b[2] - w) / dx)); gx++) cells[gy * GRID + gx].push(b);
-    }
-  }
-  const g = { version: cv.version, w, s, dx, dy, cells, wide };
-  grids.set(cv, g);
-  return g;
-}
-
-function covered(g: CoverGrid, lon: number, lat: number): boolean {
-  for (const b of g.wide) if (inBox(lon, lat, b)) return true;
-  const gx = Math.floor((lon - g.w) / g.dx), gy = Math.floor((lat - g.s) / g.dy);
-  if (gx < 0 || gy < 0 || gx >= GRID || gy >= GRID) return false;
-  for (const b of g.cells[gy * GRID + gx]) if (inBox(lon, lat, b)) return true;
-  return false;
+  return lookups.left-- > 0;
 }
 
 const glsl = /* glsl */ `\
@@ -150,7 +152,7 @@ export interface Palette {
 }
 
 interface CodesLayerProps {
-  /** For a coarser level under a finer one: what covers it now, if anything. */
+  /** For the base level: what covers it now. */
   cover?: () => Cover | null;
   /** (Not `tile`: TileLayer gives each sublayer its own `tile`, the tile's header.) */
   packed: PackedTile;
@@ -162,7 +164,10 @@ interface MaskState {
   maskBytes?: Uint8Array;
   maskCover?: Cover;
   maskVersion?: number;
+  maskView?: string;
   centres?: Float64Array;
+  /** Per finer level, the cellKey of the cell at each centre (NaN: not yet). */
+  keys?: Map<number, Float64Array>;
 }
 
 export class CodesPolygonLayer extends SolidPolygonLayer<any, CodesLayerProps> {
@@ -211,8 +216,9 @@ export class CodesPolygonLayer extends SolidPolygonLayer<any, CodesLayerProps> {
     const model = (this.state as { topModel?: { shaderInputs: { setProps(p: object): void } } }).topModel;
     if (!codes || !model) return;
     const cv = cover?.() ?? null;
-    const masked = !!cv && cv.boxes.length > 0;
-    if (masked && (state.maskCover !== cv || state.maskVersion !== cv.version)) this.updateMask(cv);
+    const masked = !!cv && cv.runs.size > 0;
+    const viewKey = masked ? boxKey(viewportBox(this.context.viewport)) : "";
+    if (masked && (state.maskCover !== cv || state.maskVersion !== cv.version || state.maskView !== viewKey)) this.updateMask(cv, viewKey);
     model.shaderInputs.setProps({
       a5colour: {
         weights: c.weights, offset: c.offset, decode: c.decode ? 1 : 0, texels: t.texels, perRow: t.perRow,
@@ -222,8 +228,8 @@ export class CodesPolygonLayer extends SolidPolygonLayer<any, CodesLayerProps> {
     super.draw(opts);
   }
 
-  /** Mask out the cells whose centres lie in a box of the cover. */
-  private updateMask(cv: Cover) {
+  /** Mask out the cells in view whose centres lie in a loaded finer run. */
+  private updateMask(cv: Cover, viewKey: string) {
     const t = this.props.packed;
     const state = this.state as unknown as MaskState;
     if (!state.centres) {
@@ -240,13 +246,38 @@ export class CodesPolygonLayer extends SolidPolygonLayer<any, CodesLayerProps> {
         c[2 * i + 1] = y / (b - a);
       }
       state.centres = c;
+      state.keys = new Map();
     }
     const rows = Math.max(1, Math.ceil(t.n / MASK_WIDTH));
-    const bytes = state.maskBytes ?? new Uint8Array(rows * MASK_WIDTH);
+    const bytes = state.maskBytes ?? new Uint8Array(rows * MASK_WIDTH).fill(255);
     state.maskBytes = bytes;
     const c = state.centres;
-    const g = coverGrid(cv);
-    for (let i = 0; i < t.n; i++) bytes[i] = covered(g, c[2 * i], c[2 * i + 1]) ? 0 : 255;
+    const view = viewportBox(this.context.viewport);
+    const levels = [...cv.runs].filter(([lod]) => lod > t.lod);
+    let complete = true;
+    for (let i = 0; i < t.n; i++) {
+      const lon = c[2 * i], lat = c[2 * i + 1];
+      // out of view: left as it is
+      if (!inBox(lon, lat, view)) continue;
+      let hidden = false;
+      for (const [lod, runs] of levels) {
+        let keys = state.keys!.get(lod);
+        if (!keys) state.keys!.set(lod, (keys = new Float64Array(t.n).fill(NaN)));
+        let k = keys[i];
+        if (Number.isNaN(k)) {
+          if (!takeLookup()) {
+            complete = false;
+            continue;
+          }
+          k = keys[i] = cellKey(lonLatToCell([lon, lat] as unknown as Parameters<typeof lonLatToCell>[0], lod));
+        }
+        if (inRuns(runs, k)) {
+          hidden = true;
+          break;
+        }
+      }
+      bytes[i] = hidden ? 0 : 255;
+    }
     state.mask ??= this.context.device.createTexture({
       format: "r8unorm",
       width: MASK_WIDTH,
@@ -256,7 +287,11 @@ export class CodesPolygonLayer extends SolidPolygonLayer<any, CodesLayerProps> {
     });
     state.mask.writeData(bytes);
     state.maskCover = cv;
-    state.maskVersion = cv.version;
+    state.maskView = viewKey;
+    // unfinished (lookups left for the next frames), or the view moved on:
+    // made again at the next draw
+    state.maskVersion = complete ? cv.version : -1;
+    if (!complete) this.setNeedsRedraw();
   }
 
   finalizeState(context: Parameters<SolidPolygonLayer["finalizeState"]>[0]) {
