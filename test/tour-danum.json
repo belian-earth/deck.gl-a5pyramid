@@ -1,0 +1,10 @@
+[
+  {"name": "Danum partition", "center": [118.2, 5.48], "zoom": 9.6, "lod": 15},
+  {"name": "Danum Valley", "center": [117.8, 4.97], "zoom": 12, "lod": 17},
+  {"name": "leaves", "center": [117.8, 4.97], "zoom": 13.5, "lod": 18},
+  {"name": "pan east", "center": [117.87, 4.97], "zoom": 13.5, "lod": 18},
+  {"name": "pan north", "center": [117.87, 5.04], "zoom": 13.5, "lod": 18},
+  {"name": "another place", "center": [118.5, 5.6], "zoom": 13, "lod": 18},
+  {"name": "its surroundings", "center": [118.5, 5.6], "zoom": 11, "lod": 16},
+  {"name": "Danum partition again", "center": [118.2, 5.48], "zoom": 9.6, "lod": 15}
+]

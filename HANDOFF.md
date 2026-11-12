@@ -102,6 +102,19 @@ Updated 2026-11-12. Design: `docs/design.md`.
     requests; the base level from the set's rows without a footer; signed
     URLs refreshed once on 403. The browser test draws it (134 cells from
     70 tiles, worst 0). 41 unit tests.
+  - **Danum, a whole store partition** (79f6800000000000, 2025, 16.8 M
+    leaves from the a5-pyramid-demo extract, `n_pixels` set to 5), written
+    by a5pyramid#6 as a store set two ways, levels 7 to 18 a file each:
+    leaves 892.7 MB in 131,072-row groups (footer and page index 141 KB)
+    against 894.0 MB in 16,384-row groups (footer 290 KB). The tour
+    (`test/tour-danum.json`, eight views; MB, requests, wall s):
+    - 16,384-row groups: 90.2, 107, 4.6.
+    - 131,072-row groups, tiles read one at a time: 91.4, 260, 4.5.
+    - 131,072-row groups, merged reads (default): 91.4, 89, 4.6.
+    Wall time is the same within 3%; the worker's read time rises with
+    merging in this harness only because its workers share one thread.
+    `TOUR_BENCH=1 TOUR_DATA=<dir> TOUR_SETS=danum-16k,danum-v4
+    TOUR_STEPS=test/tour-danum.json npx vitest run test/tour-bench.test.ts`.
 - Peer dependencies are pinned to deck.gl and luma.gl 9.4.x: the layer uses
   deck.gl internals (listed in the design notes). Test a new minor before
   widening the range.

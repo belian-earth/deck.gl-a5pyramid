@@ -1,8 +1,10 @@
-// The browser tour over local store v4 sets, one layout or read setting
-// against another (TOUR_DATA: a directory of year=2021 sets; ZSTDDEC:
-// zstddec's ESM build). Skipped unless TOUR_BENCH is set:
+// The browser tour over local store sets, one layout or read setting against
+// another. TOUR_DATA: a directory holding the sets; TOUR_SETS: the sets to
+// compare, comma separated, each a directory of TOUR_DATA (holding set.json
+// or set.parquet); TOUR_STEPS: a JSON file of the steps (name, center, zoom,
+// lod), else the Tiisi tour below. Skipped unless TOUR_BENCH is set:
 //
-//   TOUR_BENCH=1 TOUR_DATA=... ZSTDDEC=... npx vitest run test/tour-bench.test.ts
+//   TOUR_BENCH=1 TOUR_DATA=... TOUR_SETS=a,b TOUR_STEPS=steps.json npx vitest run test/tour-bench.test.ts
 //
 // The sets of 2026-11-12 (Tiisi's nine store partitions, ramet branch
 // store-v4, dev/bench/v4) were deleted after the row-group decision; rebuild
@@ -14,7 +16,8 @@
 // one source a variant so tiles cached by earlier steps are reused as they
 // would be. Worker time is in-process, one core.
 import { describe, expect, it } from "vitest";
-import { openSync, readSync, statSync } from "node:fs";
+import { existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { ZSTDDecoder } from "zstddec";
 import { PyramidSource, type ReadTuning } from "../src/source.js";
 import { setCompressors, type PackedTile } from "../src/tile-core.js";
 import { metresPerPixel } from "../src/tiling.js";
@@ -24,7 +27,8 @@ import { localWorker } from "./helpers.js";
 const DATA = process.env.TOUR_DATA ?? "";
 const ORIGIN = "http://tour.test/";
 const W = 1036, H = 663;
-const STEPS: { name: string; center: [number, number]; zoom: number; lod: number }[] = [
+type Step = { name: string; center: [number, number]; zoom: number; lod: number };
+const TIISI: Step[] = [
   { name: "Tiisi", center: [-1.0, 10.1], zoom: 7.6, lod: 13 },
   { name: "one partition", center: [-0.979, 10.04], zoom: 10, lod: 15 },
   { name: "leaves", center: [-0.979, 10.04], zoom: 13.5, lod: 18 },
@@ -34,6 +38,7 @@ const STEPS: { name: string; center: [number, number]; zoom: number; lod: number
   { name: "its leaves", center: [-1.72, 9.966], zoom: 13, lod: 18 },
   { name: "Tiisi again", center: [-1.0, 10.1], zoom: 7.6, lod: 13 },
 ];
+const STEPS: Step[] = process.env.TOUR_STEPS ? JSON.parse(readFileSync(process.env.TOUR_STEPS, "utf8")) : TIISI;
 
 const served = { bytes: 0, requests: 0 };
 const files = new Map<string, { fd: number; size: number }>();
@@ -43,6 +48,7 @@ function installLocalFetch() {
     const url = new URL(String(input));
     if (url.origin + "/" !== ORIGIN) return real(input, init);
     const path = DATA + "/" + decodeURIComponent(url.pathname.slice(1));
+    if (!files.has(path) && (!existsSync(path) || !statSync(path).isFile())) return new Response("not found", { status: 404 });
     let f = files.get(path);
     if (!f) files.set(path, (f = { fd: openSync(path, "r"), size: statSync(path).size }));
     const { fd, size } = f;
@@ -69,7 +75,7 @@ async function until(f: () => boolean) {
 }
 
 async function runTour(set: string, opts: ReadTuning) {
-  const source = await PyramidSource.open(`${ORIGIN}${set}/year=2021/`, { worker: localWorker, workers: 4, ...opts });
+  const source = await PyramidSource.open(`${ORIGIN}${set}/`, { worker: localWorker, workers: 4, ...opts });
   const rows: Record<string, number | string>[] = [];
   const seen = new Set<string>();
   for (const st of STEPS) {
@@ -102,7 +108,6 @@ async function runTour(set: string, opts: ReadTuning) {
 describe.skipIf(!process.env.TOUR_BENCH)("tour benchmark", () => {
   it("measures the tour under each variant", async () => {
     installLocalFetch();
-    const { ZSTDDecoder } = await import(process.env.ZSTDDEC!);
     const zd = new ZSTDDecoder();
     await zd.init();
     setCompressors({ ZSTD: (i: Uint8Array, n: number) => zd.decode(i, n) });
@@ -110,8 +115,8 @@ describe.skipIf(!process.env.TOUR_BENCH)("tour benchmark", () => {
     // tile a row group, and tiisi-v4, format version 4)
     const sets = (process.env.TOUR_SETS ?? "tiisi,tiisi-v4").split(",");
     const variants: [string, string, ReadTuning][] = sets.flatMap((set): [string, string, ReadTuning][] => [
-      [`${set} (defaults: one range a row group, PCA 1/16)`, set, {}],
-      [`${set}, a request a column chunk`, set, { read: { singleRange: false } }],
+      [`${set} (defaults: merged reads, one range a whole row group, PCA 1/16)`, set, {}],
+      [`${set}, tiles read one at a time`, set, { merge: false }],
     ]);
     const out: string[] = [];
     // a first pass warms the JIT and the page cache; the second is reported
