@@ -3,8 +3,9 @@
 // a set: a shard's footer arrives as bytes fetched once by the main thread,
 // and its tiles are read with range requests from the shard's URL.
 
-import { parquetMetadata, parquetRead, type FileMetaData } from "hyparquet";
+import { parquetMetadata, parquetRead, type Compressors, type FileMetaData } from "hyparquet";
 import { cellToBoundary } from "a5-js";
+import { chunkRange, listColumn, readFixedList, type ListColumn } from "./fixed-list.js";
 
 /** A tile ready for deck.gl: binary polygon attributes plus what hover needs. */
 export interface PackedTile {
@@ -122,6 +123,17 @@ interface Shard {
   metadata: FileMetaData;
   rowStarts: number[];
   file: RemoteFile;
+  /** Each vector column's list layout, null for a fixed binary one. */
+  lists: Map<string, ListColumn | null>;
+  /** Whether the shard has an ncell column (leaves of store v4 do not). */
+  hasNcell?: boolean;
+}
+
+/** Decompressors beyond hyparquet's own (snappy): store schema v4 files are
+ * zstd. A worker that reads them sets these before its first tile. */
+let compressors: Compressors | undefined;
+export function setCompressors(c: Compressors | undefined): void {
+  compressors = c;
 }
 
 /** A shard file read by HTTP range requests. */
@@ -146,7 +158,7 @@ export function openShard(url: string, byteLength: number, footer: ArrayBuffer):
   const metadata = parquetMetadata(footer);
   const rowStarts = [0];
   for (const rg of metadata.row_groups) rowStarts.push(rowStarts[rowStarts.length - 1] + Number(rg.num_rows));
-  shards.set(url, { metadata, rowStarts, file: new RemoteFile(url, byteLength) });
+  shards.set(url, { metadata, rowStarts, file: new RemoteFile(url, byteLength), lists: new Map() });
   return metadata;
 }
 
@@ -178,25 +190,40 @@ export async function readTile(
       return buf;
     },
   };
+  // a vector stored as a list is read apart, its chunk decoded flat
+  // (fixed-list.ts); a fixed binary one goes through parquetRead
+  let list: ListColumn | null = null;
+  if (vector) {
+    if (!s.lists.has(vector.name)) s.lists.set(vector.name, listColumn(s.metadata, vector.name));
+    list = s.lists.get(vector.name) ?? null;
+  }
+  const listMeta = list ? s.metadata.row_groups[tile].columns[list.index].meta_data! : null;
+  // leaves carry no ncell (store schema v4): each stands for itself
+  if (s.hasNcell === undefined) s.hasNcell = s.metadata.schema.some((e) => e.name === "ncell");
   const chunks = new Map<string, ArrayLike<unknown>[]>();
-  await parquetRead({
-    file,
-    metadata: s.metadata,
-    rowStart: s.rowStarts[tile],
-    rowEnd: s.rowStarts[tile + 1],
-    columns: ["cell", "ncell", ...columns, ...(vector ? [vector.name] : [])],
-    onChunk: (c) => {
-      const list = chunks.get(c.columnName) ?? [];
-      list.push(c.columnData as ArrayLike<unknown>);
-      chunks.set(c.columnName, list);
-    },
-  });
+  const [, listBytes] = await Promise.all([
+    parquetRead({
+      file,
+      metadata: s.metadata,
+      compressors,
+      rowStart: s.rowStarts[tile],
+      rowEnd: s.rowStarts[tile + 1],
+      columns: ["cell", ...(s.hasNcell ? ["ncell"] : []), ...columns, ...(vector && !list ? [vector.name] : [])],
+      onChunk: (c) => {
+        const part = chunks.get(c.columnName) ?? [];
+        part.push(c.columnData as ArrayLike<unknown>);
+        chunks.set(c.columnName, part);
+      },
+    }),
+    listMeta ? file.slice(...chunkRange(listMeta)) : Promise.resolve(null),
+  ]);
   const t1 = performance.now();
   const n = s.rowStarts[tile + 1] - s.rowStarts[tile];
   const cells = new BigUint64Array(n);
   copyInto(cells, chunks.get("cell") ?? [], (v) => (typeof v === "bigint" ? BigInt.asUintN(64, v) : BigInt(v as number)));
   const ncell = new Uint32Array(n);
-  copyInto(ncell, chunks.get("ncell") ?? [], (v) => Number(v));
+  if (s.hasNcell) copyInto(ncell, chunks.get("ncell") ?? [], (v) => Number(v));
+  else ncell.fill(1);
   const values = columns.map((name) => {
     const out = new Int8Array(n);
     copyInto(out, chunks.get(name) ?? [], (v) => (v == null ? 0 : Number(v)));
@@ -212,14 +239,18 @@ export async function readTile(
   if (vector) {
     const direct = dim % 4 === 0 && dim <= MAX_INPUTS;
     vec = direct ? new Int8Array(codes.buffer, 0, n * dim) : new Int8Array(n * dim);
-    let i = 0;
-    for (const part of chunks.get(vector.name) ?? []) {
-      for (let j = 0; j < part.length && i < n; j++, i++) {
-        const row = part[j] as Uint8Array;
-        vec.set(new Int8Array(row.buffer, row.byteOffset, dim), i * dim);
+    if (list && listMeta && listBytes) {
+      readFixedList(new Uint8Array(listBytes), listMeta, list, dim, vec, compressors);
+    } else {
+      let i = 0;
+      for (const part of chunks.get(vector.name) ?? []) {
+        for (let j = 0; j < part.length && i < n; j++, i++) {
+          const row = part[j] as Uint8Array;
+          vec.set(new Int8Array(row.buffer, row.byteOffset, dim), i * dim);
+        }
       }
+      if (i !== n) throw new Error(`vector column has ${i} rows for ${n}`);
     }
-    if (i !== n) throw new Error(`vector column has ${i} rows for ${n}`);
     if (!direct) {
       const m = Math.min(dim, MAX_INPUTS);
       for (let c = 0; c < n; c++) for (let k = 0; k < m; k++) codes[at(c) + k] = vec[c * dim + k] & 255;
