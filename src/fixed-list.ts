@@ -10,6 +10,7 @@
 import type { ColumnMetaData, Compressors, FileMetaData } from "hyparquet";
 import { parquetHeader } from "hyparquet/src/column.js";
 import { decompressPage } from "hyparquet/src/datapage.js";
+import { deltaBinaryUnpack } from "hyparquet/src/delta.js";
 import { readRleBitPackedHybrid } from "hyparquet/src/encoding.js";
 import { readPlain } from "hyparquet/src/plain.js";
 import { getMaxDefinitionLevel, getMaxRepetitionLevel, getSchemaPath } from "hyparquet/src/schema.js";
@@ -236,8 +237,12 @@ export function readFixedList(
     if (encoding === "RLE_DICTIONARY" || encoding === "PLAIN_DICTIONARY") {
       if (!dict) throw new Error("a dictionary-encoded page without a dictionary");
       decodeDict(values, 1, values.length, values[0], dict, dst);
-    } else if (encoding === "PLAIN") {
-      const v = readPlain({ view: new DataView(values.buffer, values.byteOffset, values.byteLength), offset: 0 }, "INT32", n, undefined) as Int32Array;
+    } else if (encoding === "PLAIN" || encoding === "DELTA_BINARY_PACKED") {
+      // DuckDB writes small row groups (a few hundred rows) delta packed
+      const reader = { view: new DataView(values.buffer, values.byteOffset, values.byteLength), offset: 0 };
+      let v: Int32Array;
+      if (encoding === "PLAIN") v = readPlain(reader, "INT32", n, undefined) as Int32Array;
+      else deltaBinaryUnpack(reader, n, (v = new Int32Array(n)));
       for (let i = 0; i < n; i++) dst[i] = v[i];
     } else throw new Error(`unsupported encoding ${encoding} for a list vector`);
     pos += n;

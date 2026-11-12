@@ -82,3 +82,24 @@ describe("level runs", () => {
     expect(levelsWhole(packedRep(false), Uint8Array.from([0xfe, 0x03, 3, 0x02, 2]), n, dim, 3)).toBe(false);
   });
 });
+
+describe("a DuckDB list column", () => {
+  it("reads delta-packed v2 pages, as DuckDB writes small row groups", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { parquetMetadata } = await import("hyparquet");
+    const { listColumn, chunkRange, readFixedList } = await import("../src/fixed-list.js");
+    const b = readFileSync(new URL("./fixtures/lists/duckdb-v2.parquet", import.meta.url));
+    const ab = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+    const md = parquetMetadata(ab);
+    const list = listColumn(md, "v")!;
+    expect(list).not.toBeNull();
+    const meta = md.row_groups[0].columns[list.index].meta_data!;
+    expect(meta.encodings).toContain("DELTA_BINARY_PACKED");
+    const [s, e] = chunkRange(meta);
+    const out = readFixedList(new Uint8Array(ab.slice(s, e)), meta, list, 64, new Int8Array(1000 * 64));
+    // written as ((i * 37 + e * 11) % 256) - 128, row i, element e
+    let wrong = 0;
+    for (let i = 0; i < 1000; i++) for (let k = 0; k < 64; k++) if (out[i * 64 + k] !== ((i * 37 + k * 11) % 256) - 128) wrong++;
+    expect(wrong).toBe(0);
+  });
+});
