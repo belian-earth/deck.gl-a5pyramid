@@ -410,73 +410,96 @@ async function pagesOf(s: Shard, group: number, names: string[]): Promise<TilePa
   return { cols: out, fetched };
 }
 
-/** Read a tile that is one data page of every column chunk of its row group:
- * one request a column for its page (the row group's page index and
- * dictionaries read once a worker), flat columns decoded by hyparquet, the
- * list vector by the flat list reader. */
-async function readTilePages(s: Shard, url: string, loc: TileLoc, columns: string[],
-  vector: { name: string; dim: number } | null): Promise<Rows> {
+/** Read tiles of one row group, each one data page of every column chunk:
+ * for each column, one request for each run of consecutive pages the tiles
+ * want (the row group's page index and dictionaries read once a worker);
+ * flat columns decoded by hyparquet, the list vector by the flat list
+ * reader. The fetch is counted against the first tile. */
+async function readTilePages(s: Shard, url: string, locs: TileLoc[], columns: string[],
+  vector: { name: string; dim: number } | null): Promise<Rows[]> {
   const t0 = performance.now();
   const list = vectorList(s, vector);
   if (s.hasNcell === undefined) s.hasNcell = s.metadata.schema.some((e) => e.name === "ncell");
   s.tree ??= parquetSchema(s.metadata);
-  const tile = loc.rowGroup;
-  const groupRows = s.rowStarts[tile + 1] - s.rowStarts[tile];
-  const r0 = loc.start;
-  const n = loc.rows;
+  const group = locs[0].rowGroup;
+  if (locs.some((l) => l.rowGroup !== group)) throw new Error("tiles of several row groups in one read");
+  const groupRows = s.rowStarts[group + 1] - s.rowStarts[group];
   const flat = ["cell", ...(s.hasNcell ? ["ncell"] : []), ...columns, ...(vector && !list ? [vector.name] : [])];
   const names = [...flat, ...(list ? [vector!.name] : [])];
   let first = false;
-  const tp = await cached(tilePages, `${url}#${tile}`, 64, () => ((first = true), pagesOf(s, tile, names)));
+  const tp = await cached(tilePages, `${url}#${group}`, 64, () => ((first = true), pagesOf(s, group, names)));
   let fetched = first ? tp.fetched : 0;
-  // each column's page of the tile, all at once
-  const bytes = new Map<string, Uint8Array>();
+  const pages = [...new Set(locs.map((l) => l.page))].sort((a, b) => a - b);
+  // each column's pages, a request a run of consecutive pages (which lie
+  // together in the chunk), all columns at once
+  const bytes = new Map<string, Map<number, Uint8Array>>();
   await Promise.all(names.map(async (name) => {
     const c = tp.cols.get(name);
     if (!c) throw new Error(`no column ${name}`);
-    const k = loc.page;
-    if (c.pages[k]?.first !== r0) throw new Error(`page ${k} of ${name} in row group ${tile} does not start at row ${r0}: its pages are not the tiles`);
-    const end = k + 1 < c.pages.length ? c.pages[k + 1].first : groupRows;
-    if (end - r0 !== n) throw new Error(`page ${k} of ${name} in row group ${tile} holds ${end - r0} rows, its tile ${n}`);
-    const page = new Uint8Array(await s.file.slice(c.pages[k].offset, c.pages[k].offset + c.pages[k].size));
-    fetched += page.byteLength;
-    const both = new Uint8Array(c.dict.length + page.length);
-    both.set(c.dict);
-    both.set(page, c.dict.length);
-    bytes.set(name, both);
+    for (const l of locs) {
+      const k = l.page;
+      if (c.pages[k]?.first !== l.start) throw new Error(`page ${k} of ${name} in row group ${group} does not start at row ${l.start}: its pages are not the tiles`);
+      const end = k + 1 < c.pages.length ? c.pages[k + 1].first : groupRows;
+      if (end - l.start !== l.rows) throw new Error(`page ${k} of ${name} in row group ${group} holds ${end - l.start} rows, its tile ${l.rows}`);
+    }
+    const out = new Map<number, Uint8Array>();
+    for (let a = 0; a < pages.length; ) {
+      let b = a;
+      while (b + 1 < pages.length && pages[b + 1] === pages[b] + 1) b++;
+      const lo = c.pages[pages[a]].offset, hi = c.pages[pages[b]].offset + c.pages[pages[b]].size;
+      const buf = await s.file.slice(lo, hi);
+      fetched += buf.byteLength;
+      for (let k = a; k <= b; k++) {
+        const p = c.pages[pages[k]];
+        const both = new Uint8Array(c.dict.length + p.size);
+        both.set(c.dict);
+        both.set(new Uint8Array(buf, p.offset - lo, p.size), c.dict.length);
+        out.set(pages[k], both);
+      }
+      a = b + 1;
+    }
+    bytes.set(name, out);
   }));
   const t1 = performance.now();
-  const chunks = new Map<string, ArrayLike<unknown>[]>();
-  for (const name of flat) {
-    const c = tp.cols.get(name)!;
-    const b = bytes.get(name)!;
-    const schemaPath = getTreePath(s.tree, c.meta.path_in_schema);
-    const decoder = {
-      pathInSchema: c.meta.path_in_schema, element: schemaPath[schemaPath.length - 1].element, schemaPath,
-      type: c.meta.type, codec: c.meta.codec, compressors, parsers: DEFAULT_PARSERS, utf8: true,
-    };
-    const { data } = readColumn({ view: new DataView(b.buffer, b.byteOffset, b.byteLength), offset: 0 },
-      { groupStart: 0, groupRows: n, selectStart: 0, selectEnd: n }, decoder as any);
-    chunks.set(name, data as ArrayLike<unknown>[]);
-  }
-  const { cells, ncell, values } = flatRows(n, chunks, columns, !!s.hasNcell);
-  let vec: Int8Array | null = null;
-  if (vector) {
-    vec = new Int8Array(n * vector.dim);
-    if (list) {
-      const c = tp.cols.get(vector.name)!;
-      readFixedList(bytes.get(vector.name)!, { ...c.meta, num_values: BigInt(n * vector.dim) }, list, vector.dim, vec, compressors);
-    } else {
-      let i = 0;
-      for (const part of chunks.get(vector.name) ?? []) {
-        for (let j = 0; j < part.length && i < n; j++, i++) {
-          const row = part[j] as Uint8Array;
-          vec.set(new Int8Array(row.buffer, row.byteOffset, vector.dim), i * vector.dim);
+  const rows = locs.map((loc, at): Rows => {
+    const d0 = performance.now();
+    const n = loc.rows;
+    const chunks = new Map<string, ArrayLike<unknown>[]>();
+    for (const name of flat) {
+      const c = tp.cols.get(name)!;
+      const b = bytes.get(name)!.get(loc.page)!;
+      const schemaPath = getTreePath(s.tree!, c.meta.path_in_schema);
+      const decoder = {
+        pathInSchema: c.meta.path_in_schema, element: schemaPath[schemaPath.length - 1].element, schemaPath,
+        type: c.meta.type, codec: c.meta.codec, compressors, parsers: DEFAULT_PARSERS, utf8: true,
+      };
+      const { data } = readColumn({ view: new DataView(b.buffer, b.byteOffset, b.byteLength), offset: 0 },
+        { groupStart: 0, groupRows: n, selectStart: 0, selectEnd: n }, decoder as any);
+      chunks.set(name, data as ArrayLike<unknown>[]);
+    }
+    const { cells, ncell, values } = flatRows(n, chunks, columns, !!s.hasNcell);
+    let vec: Int8Array | null = null;
+    if (vector) {
+      vec = new Int8Array(n * vector.dim);
+      if (list) {
+        const c = tp.cols.get(vector.name)!;
+        readFixedList(bytes.get(vector.name)!.get(loc.page)!, { ...c.meta, num_values: BigInt(n * vector.dim) }, list, vector.dim, vec, compressors);
+      } else {
+        let i = 0;
+        for (const part of chunks.get(vector.name) ?? []) {
+          for (let j = 0; j < part.length && i < n; j++, i++) {
+            const row = part[j] as Uint8Array;
+            vec.set(new Int8Array(row.buffer, row.byteOffset, vector.dim), i * vector.dim);
+          }
         }
       }
     }
-  }
-  return { n, cells, ncell, values, vector: vec, fetched, readMs: t1 - t0, decodeMs: performance.now() - t1 };
+    return {
+      n, cells, ncell, values, vector: vec,
+      fetched: at === 0 ? fetched : 0, readMs: at === 0 ? t1 - t0 : 0, decodeMs: performance.now() - d0,
+    };
+  });
+  return rows;
 }
 
 /** Pack rows [a, b) of decoded rows into a tile. */
@@ -535,8 +558,29 @@ export async function readTile(
   const loc = s.tiles[tile];
   if (!loc) throw new Error(`${url} has no tile ${tile}`);
   const dim = vector ? vector.dim : null;
-  const r = loc.shared ? await readTilePages(s, url, loc, columns, vector) : await readRows(s, loc.rowGroup, columns, vector, opts);
+  const r = loc.shared ? (await readTilePages(s, url, [loc], columns, vector))[0] : await readRows(s, loc.rowGroup, columns, vector, opts);
   return packRows(r, 0, r.n, lod, dim, withStats, opts.statsEvery, r);
+}
+
+/** Read several tiles of one row group of an open shard together (one
+ * request a column for each run of their pages) and pack them, in order. */
+export async function readTiles(
+  url: string, tiles: number[], lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
+  opts: ReadOptions = {},
+): Promise<PackedTile[]> {
+  const s = shards.get(url);
+  if (!s) throw new Error(`shard not open: ${url}`);
+  const locs = tiles.map((t) => {
+    const loc = s.tiles[t];
+    if (!loc) throw new Error(`${url} has no tile ${t}`);
+    return loc;
+  });
+  if (!locs.every((l) => l.shared && l.rowGroup === locs[0].rowGroup)) {
+    return Promise.all(tiles.map((t) => readTile(url, t, lod, columns, withStats, vector, opts)));
+  }
+  const dim = vector ? vector.dim : null;
+  const rows = await readTilePages(s, url, locs, columns, vector);
+  return rows.map((r) => packRows(r, 0, r.n, lod, dim, withStats, opts.statsEvery, r));
 }
 
 function copyInto<T>(out: { [i: number]: T; length: number }, parts: ArrayLike<unknown>[], conv: (v: unknown) => T) {
@@ -597,6 +641,9 @@ export type WorkerRequest =
   | {
       id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number;
       columns: string[]; stats?: boolean; vector?: { name: string; dim: number } | null; read?: ReadOptions;
+      /** Several tiles of one row group, read together: one request a
+       * column for their pages. The reply has `tiles` in this order. */
+      tiles?: number[];
     };
 
 /**
@@ -619,6 +666,10 @@ export async function handleRequest(m: WorkerRequest): Promise<{ reply: Record<s
     if (!hasShard(m.url)) {
       if (!m.footer) throw new Error(`no footer for ${m.url}`);
       openShard(m.url, m.bytes, m.footer);
+    }
+    if (m.tiles && m.tiles.length > 1) {
+      const tiles = await readTiles(m.url, m.tiles, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {});
+      return { reply: { id: m.id, tiles }, transfer: tiles.flatMap(transferables) };
     }
     const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {});
     return { reply: { id: m.id, tile }, transfer: transferables(tile) };

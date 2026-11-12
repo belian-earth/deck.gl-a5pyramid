@@ -3,7 +3,7 @@
 
 import { expect, test } from "@playwright/test";
 
-for (const name of ["bands", "vector", "vector-rg"]) {
+for (const name of ["bands", "vector", "vector-rg", "store-v4"]) {
   test(`${name}: drawn colours match the formula`, async ({ page }) => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(String(e)));

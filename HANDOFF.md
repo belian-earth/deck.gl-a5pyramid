@@ -11,7 +11,7 @@ Updated 2026-11-12. Design: `docs/design.md`.
   demo installs `github:belian-earth/deck.gl-a5pyramid#v0.1.0`.
   GitHub only for now; npm once the API settles (Hugh, 2026-11-10). Licence
   Apache 2.0, as a5pyramid.
-- `npm run check`, `npm test` (36 unit tests in Node against fixture sets
+- `npm run check`, `npm test` (41 unit tests in Node against fixture sets
   written by a5pyramid) and `npm run test:browser` (GPU colours read
   back in headless Chrome: 134 cells a set, within 1/255 of the formula)
   pass. CI runs all three and the build; the first run on GitHub passed
@@ -70,8 +70,38 @@ Updated 2026-11-12. Design: `docs/design.md`.
     The browser test draws `vector-rg` too (134 cells from 69 tiles, worst
     0). `test/tour-bench.test.ts` (was `pieces-bench`, `TOUR_BENCH`)
     compares sets; its Tiisi sets were deleted and need rebuilding.
-  - Open: coalescing a tile's adjacent pages, or adjacent tiles' pages, into
-    fewer requests (the 2.3 times).
+- Same branch, 2026-11-12, the rest of format version 4 (a5pyramid#6,
+  9bebc07) and the store's renderer items (belian-production
+  `docs/store-v4.md` 6.2 and 9):
+  - **Sets:** `PyramidSource.open()` reads `set.json` or `set.parquet` (a
+    shard table, `readSetTable()`; a directory without `set.json` falls
+    back to it, whether the server answers 403, 404 or a page);
+    `PyramidSource.fromSet()` takes a set given whole, each shard with a
+    `url` (a signed URL from belianapi) or a `path`. Empty shards (no
+    file) are skipped; unwrapped boxes are wrapped.
+  - **Refresh:** with `refresh`, a footer or tile read refused with HTTP
+    403, 404 or 410 fetches the set once more and is retried; a shard
+    whose file changed is reopened and its tiles dropped.
+  - **Partial rows** are all drawn (every row, the rule of 3.3); the
+    weights column is not read; list vectors, `ncell` and `lod` optional
+    as before.
+  - **Base level:** a tier of one level (a store's) is costed from the
+    set's rows without a footer, and the base level goes up through such
+    tiers while they fit the budget.
+  - **zstd:** the bundled worker decodes Zstandard pages with zstddec
+    (0.2.0, a dependency now), set up before its first message.
+  - **Merged reads:** the pool dispatches in a microtask, and a decode job
+    takes up to 7 more queued tiles of its row group (`Pool.MERGE`); the
+    worker reads each column once for each run of consecutive pages
+    (`readTiles()`). `merge: false` turns it off.
+  - **Tests:** `test/store-v4.test.ts` on the fixture `store-v4`
+    (`tools/fixture-store-v4.R`): a store in miniature, ten single-level
+    tiers, three partitions with partial rows and `owner`, list vectors,
+    `n_pixels`, an empty partition, `set.parquet` only. Every partial row
+    drawn and every leaf counted once; merged reads take under half the
+    requests; the base level from the set's rows without a footer; signed
+    URLs refreshed once on 403. The browser test draws it (134 cells from
+    70 tiles, worst 0). 41 unit tests.
 - Peer dependencies are pinned to deck.gl and luma.gl 9.4.x: the layer uses
   deck.gl internals (listed in the design notes). Test a new minor before
   widening the range.

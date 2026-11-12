@@ -16,12 +16,18 @@ export interface Tier {
 export interface ShardEntry {
   tier: number;
   cell: string;
-  path: string;
+  /** Relative to the set's base; null for a shard listed as empty, with no
+   * file (format version 4). */
+  path: string | null;
+  /** The file's URL, such as a signed URL a service gives; used in place of
+   * `path` where given. */
+  url?: string;
   rows: number;
   tiles: number;
   bytes: number;
   footer_bytes: number;
-  bbox: Box;
+  /** null for an empty shard. */
+  bbox: Box | null;
 }
 
 export interface ColumnMeta {
@@ -32,6 +38,8 @@ export interface ColumnMeta {
   sd?: number;
   /** A vector column (format version 3): elements per cell, one byte each. */
   dim?: number;
+  /** Format version 4: "list" for a vector stored as a list of its elements. */
+  storage?: string;
 }
 
 export interface SetIndex {
@@ -42,6 +50,9 @@ export interface SetIndex {
   a5_index: string;
   data_resolution: number;
   columns: ColumnMeta[];
+  /** Format version 4: the weights column every shard stores, which is not
+   * drawn. */
+  weights?: { name: string; type: string };
   tiers: Tier[];
   bbox: Box;
   shards: ShardEntry[];
@@ -77,6 +88,9 @@ export function checkSet(s: SetIndex): SetIndex {
   if (s.format !== "a5pyramid-set") throw new Error(`not an a5pyramid set: format ${JSON.stringify(s.format)}`);
   if (s.format_version > FORMAT_VERSION) throw new Error(`set format version ${s.format_version} is newer than ${FORMAT_VERSION}`);
   if (s.a5_index !== A5_INDEX) throw new Error(`set holds A5 index ${s.a5_index} ids; this reader draws ${A5_INDEX}`);
+  // boxes as a shard table keeps them (east above 180 across the
+  // antimeridian), wrapped as everywhere else here
+  for (const e of s.shards) if (e.bbox && e.bbox[2] > 180) e.bbox = [e.bbox[0], e.bbox[1], e.bbox[2] - 360, e.bbox[3]];
   return s;
 }
 
