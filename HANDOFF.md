@@ -126,7 +126,11 @@ Updated 2026-11-12. Design: `docs/design.md`.
    embeddings to its donor region with a `MaskExtension`; a browser test
    checks nothing is drawn outside the mask (230 sampled pixels drawn there
    without the change, 0 with it). A tag `v0.2.0` after it merges lets
-   apps pin a release rather than a commit (Hugh's).
+   apps pin a release rather than a commit (Hugh's). The same branch sets
+   hyparquet to `~1.33.0`: `fixed-list.ts` imports its internals
+   (`parquetHeader` from `src/column.js`, exported from 1.33.0 only), so
+   `^1.31.2` let an app keep a hyparquet without it (the ramet47 app's
+   1.31.2 failed to import the renderer), and a later minor may move them.
 1. a5view could load this package instead of its own copy of the lazy
    renderer, one renderer for both.
 2. Propose to deck.gl: abort loading tiles that left the view whatever the
