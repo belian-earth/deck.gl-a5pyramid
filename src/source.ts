@@ -16,7 +16,7 @@ import {
   type SetIndex,
   type ShardEntry,
 } from "./format.js";
-import type { PackedTile } from "./tile-core.js";
+import type { PackedTile, ReadOptions } from "./tile-core.js";
 import { boxKey } from "./tiling.js";
 
 /** A box meeting every tile. */
@@ -43,13 +43,44 @@ interface ShardState {
   tileBytes?: number[];
   opening?: Promise<void>;
   failed?: string;
+  /** Pieces of the tiles: their rows, first piece of each tile, and boxes
+   * (from the index, or probed tile by tile). */
+  pieceRows?: number;
+  pieceStart?: number[];
+  pieceBox?: Float32Array;
+  probes?: Map<number, Float32Array>;
+  probing?: Set<number>;
 }
 
 export interface TileRef {
   key: string;
   shard: ShardState;
   tile: number;
+  /** The piece of the tile, when tiles are read in pieces. */
+  piece?: number;
   box: Box;
+}
+
+/**
+ * How tiles are cut and read (the viewer's optimisations of 2026-11-12).
+ * `pieces`: "auto" reads the pieces a set's index declares (pages cut at
+ * `piece_rows`, a box each) and whole tiles otherwise; "probe" also cuts
+ * tiles without them into pieces of `pieceRows`, boxes probed from each
+ * tile's cells; "off" reads whole tiles. `read`: one range request a tile,
+ * and the PCA sample rate.
+ */
+export interface PieceOptions {
+  pieces?: "auto" | "probe" | "off";
+  pieceRows?: number;
+  read?: Pick<ReadOptions, "singleRange" | "statsEvery">;
+}
+
+/** Floats of base64 (little-endian float32). */
+function base64Floats(b64: string): Float32Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Float32Array(bytes.buffer);
 }
 
 export interface SourceStats {
@@ -59,7 +90,13 @@ export interface SourceStats {
   tileBytes: number;
   tilesDecoded: number;
   readMs: number;
+  /** Worker time decoding vectors and filling codes textures. */
+  decodeMs: number;
   packMs: number;
+  /** Probes of tiles for their pieces' boxes: bytes and worker time. */
+  probes: number;
+  probeBytes: number;
+  probeMs: number;
   /** Worker time spent on tiles' PCA sums. */
   statsMs: number;
   cached: number;
@@ -81,6 +118,9 @@ interface Job {
   /** Its batch (one per task that submitted jobs) and order of submission. */
   batch: number;
   seq: number;
+  /** Jobs of one affinity (the pieces of a tile) go to the worker that ran
+   * the last of them when it has room: it holds their row group. */
+  affinity?: string;
 }
 
 /**
@@ -137,10 +177,10 @@ class Pool {
     return this.queue.length + this.urgent.length;
   }
 
-  submit(build: Job["build"], shard: string, urgent = false): { job: Job; promise: Promise<any> } {
+  submit(build: Job["build"], shard: string, urgent = false, affinity?: string): { job: Job; promise: Promise<any> } {
     let job!: Job;
     const promise = new Promise<any>((resolve, reject) => {
-      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent, batch: 0, seq: 0 };
+      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent, batch: 0, seq: 0, affinity };
     });
     this.stamp(job);
     (urgent ? this.urgent : this.queue).push(job);
@@ -192,6 +232,8 @@ class Pool {
     return line.splice(best, 1)[0];
   }
 
+  private affine = new Map<string, number>();
+
   private pump() {
     while (this.urgent.length || (this.queue.length && !this.urgentRunning)) {
       let slot = -1;
@@ -200,6 +242,12 @@ class Pool {
       }
       if (slot < 0) return;
       const job = this.take(this.urgent.length ? this.urgent : this.queue);
+      if (job.affinity != null) {
+        const pref = this.affine.get(job.affinity);
+        if (pref != null && this.workers[pref].busy < Pool.PER_WORKER) slot = pref;
+        if (this.affine.size > 4096) this.affine.clear();
+        this.affine.set(job.affinity, slot);
+      }
       job.started = true;
       if (job.urgent) this.urgentRunning++;
       const w = this.workers[slot];
@@ -235,7 +283,8 @@ export class PyramidSource {
   /** Called when a shard opens; the layer redraws. */
   onChange: (() => void) | null = null;
   readonly stats: SourceStats = {
-    cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, packMs: 0, statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
+    cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, decodeMs: 0, packMs: 0,
+    probes: 0, probeBytes: 0, probeMs: 0, statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
   };
   /** The set's metadata from its writer (the `a5pyramids` entry), parsed. */
   readonly meta: Record<string, any>;
@@ -249,7 +298,8 @@ export class PyramidSource {
   private sizes = new Map<string, number>();
   private pool: Pool;
 
-  private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number, worker: WorkerFactory) {
+  private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number, worker: WorkerFactory,
+    readonly pieces: Required<Omit<PieceOptions, "read">> & { read: PieceOptions["read"] } = { pieces: "auto", pieceRows: 2048, read: {} }) {
     this.lods = setLods(set);
     // scalar columns by name; the vector column (an embedding), if any, apart
     this.columns = set.columns.filter((c) => c.dim == null).map((c) => c.name);
@@ -272,14 +322,16 @@ export class PyramidSource {
    * `cacheBytes`: decoded tiles kept, least recently used dropped first
    * (default 512 MB); `worker`: how to make a worker (default the bundled one).
    */
-  static async open(base: string, opts: { workers?: number; cacheBytes?: number; worker?: WorkerFactory } = {}): Promise<PyramidSource> {
+  static async open(base: string, opts: { workers?: number; cacheBytes?: number; worker?: WorkerFactory } & PieceOptions = {}): Promise<PyramidSource> {
     // relative to the page, where there is one
     const url = new URL(base.endsWith("/") ? base : base + "/", globalThis.location?.href).href;
     const res = await fetch(new URL("set.json", url));
     if (!res.ok) throw new Error(`${url}set.json: HTTP ${res.status}`);
     const set = checkSet(await res.json());
     const workers = opts.workers ?? Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 2));
-    return new PyramidSource(url, set, workers, opts.cacheBytes ?? 512 * 1024 * 1024, opts.worker ?? defaultWorker);
+    return new PyramidSource(url, set, workers, opts.cacheBytes ?? 512 * 1024 * 1024, opts.worker ?? defaultWorker, {
+      pieces: opts.pieces ?? "auto", pieceRows: opts.pieceRows ?? 2048, read: opts.read ?? {},
+    });
   }
 
   get workers() {
@@ -317,6 +369,66 @@ export class PyramidSource {
     return this.shardsIn(tier, box).every((s) => s.index || s.failed);
   }
 
+  /** Whether `lod` can be selected for `box`: its shards there have opened
+   * and, when tiles are probed for pieces, its tiles there have been. */
+  ready(lod: number, box: Box): boolean {
+    if (!this.opened(this.tierOf(lod), box)) return false;
+    if (this.pieces.pieces !== "probe") return true;
+    // tiles not yet probed are probed now; the level waits for them
+    let ready = true;
+    for (const s of this.shardsIn(this.tierOf(lod), box)) {
+      if (!s.index || s.pieceBox) continue;
+      const level = s.index.levels.find((l) => l.lod === lod);
+      if (!level) continue;
+      for (let i = level.tiles[0]; i < level.tiles[1]; i++) {
+        if (!s.probes?.has(i) && boxesMeet(tileBox(s.index, i), box)) {
+          this.probe(s, i, lod);
+          ready = false;
+        }
+      }
+    }
+    return ready;
+  }
+
+  /** Probe tile `i` of `s` for its pieces' boxes (once). */
+  private probe(s: ShardState, i: number, lod: number) {
+    s.probes ??= new Map();
+    s.probing ??= new Set();
+    if (s.probes.has(i) || s.probing.has(i) || !s.footer) return;
+    s.probing.add(i);
+    const footer = s.footer;
+    const pieceRows = this.pieces.pieceRows;
+    this.pool.submit(
+      (id, needsFooter) => ({ id, type: "probe", url: s.url, bytes: s.entry.bytes, footer: needsFooter ? footer.slice(0) : undefined, tile: i, lod, pieceRows }),
+      s.url, false, `${s.url}#${i}`,
+    ).promise.then((out) => {
+      s.probes!.set(i, out.probe.boxes as Float32Array);
+      this.stats.probes++;
+      this.stats.probeBytes += out.probe.fetched;
+      this.stats.probeMs += out.probe.ms;
+      this.version++;
+      this.onChange?.();
+    }, (e) => console.error(`[deck.gl-a5pyramid] probe ${s.entry.path}#${i}: ${e}`)).finally(() => s.probing!.delete(i));
+  }
+
+  /** The pieces' boxes of tile `i` of `s`, and its first piece's position in
+   * them; null when the tile is read whole (or not yet probed). */
+  private piecesOf(s: ShardState, i: number): { boxes: Float32Array; first: number; count: number } | null {
+    if (this.pieces.pieces === "off") return null;
+    const rows = s.tileRows?.[i] ?? 0;
+    if (s.pieceBox && s.pieceStart && s.pieceRows) return { boxes: s.pieceBox, first: s.pieceStart[i], count: s.pieceStart[i + 1] - s.pieceStart[i] };
+    if (this.pieces.pieces === "probe") {
+      const b = s.probes?.get(i);
+      return b ? { boxes: b, first: 0, count: Math.ceil(rows / this.pieces.pieceRows) } : null;
+    }
+    return null;
+  }
+
+  /** Rows of a piece's tile cut, and its rows. */
+  private pieceRowsOf(s: ShardState): number {
+    return s.pieceBox ? s.pieceRows! : this.pieces.pieceRows;
+  }
+
   private openShard(s: ShardState): Promise<void> {
     if (s.index || s.failed) return Promise.resolve();
     if (s.opening) return s.opening;
@@ -338,6 +450,13 @@ export class PyramidSource {
         s.index = checkIndex(JSON.parse(out.kv.a5pyramid), out.kv.a5_index, s.entry.path);
         s.tileRows = out.tileRows;
         s.tileBytes = out.tileBytes;
+        const ix = s.index as PyramidIndex & { piece_rows?: number; piece_bbox_f32?: string };
+        if (this.pieces.pieces !== "off" && ix.piece_rows && ix.piece_bbox_f32) {
+          s.pieceRows = ix.piece_rows;
+          s.pieceBox = base64Floats(ix.piece_bbox_f32);
+          s.pieceStart = [0];
+          for (const r of s.tileRows!) s.pieceStart.push(s.pieceStart[s.pieceStart.length - 1] + Math.ceil(r / ix.piece_rows));
+        }
         this.stats.shardsOpen++;
         this.version++;
         this.onChange?.();
@@ -362,7 +481,17 @@ export class PyramidSource {
       if (!level) continue;
       for (let i = level.tiles[0]; i < level.tiles[1]; i++) {
         const b = tileBox(idx, i);
-        if (boxesMeet(b, box)) out.push({ key: `${s.entry.path}#${i}`, shard: s, tile: i, box: b });
+        if (!boxesMeet(b, box)) continue;
+        const ps = this.piecesOf(s, i);
+        if (ps) {
+          for (let k = 0; k < ps.count; k++) {
+            const o = (ps.first + k) * 4;
+            const pb: Box = [ps.boxes[o], ps.boxes[o + 1], ps.boxes[o + 2], ps.boxes[o + 3]];
+            if (boxesMeet(pb, box)) out.push({ key: `${s.entry.path}#${i}.${k}`, shard: s, tile: i, piece: k, box: pb });
+          }
+        } else if (this.pieces.pieces === "probe" && !s.pieceBox) {
+          this.probe(s, i, lod);
+        } else out.push({ key: `${s.entry.path}#${i}`, shard: s, tile: i, box: b });
       }
     }
     return out;
@@ -396,8 +525,17 @@ export class PyramidSource {
     if (!this.opened(this.tierOf(lod), box)) return null;
     let rows = 0, bytes = 0, tiles = 0;
     for (const t of this.tilesIn(lod, box)) {
-      rows += t.shard.tileRows?.[t.tile] ?? 0;
-      bytes += t.shard.tileBytes?.[t.tile] ?? 0;
+      const tr = t.shard.tileRows?.[t.tile] ?? 0;
+      const tb = t.shard.tileBytes?.[t.tile] ?? 0;
+      if (t.piece != null) {
+        const pr = this.pieceRowsOf(t.shard);
+        const r = Math.min(pr, tr - t.piece * pr);
+        rows += r;
+        bytes += tr ? (tb * r) / tr : 0;
+      } else {
+        rows += tr;
+        bytes += tb;
+      }
       tiles++;
     }
     if (this.costs.size > 512) this.costs.clear();
@@ -408,9 +546,15 @@ export class PyramidSource {
   private costs = new Map<string, { rows: number; bytes: number; tiles: number }>();
 
   tileBox(key: string): Box | null {
-    const [path, i] = key.split("#");
+    const [path, ref] = key.split("#");
     const s = this.byPath.get(path);
-    return s?.index ? tileBox(s.index, Number(i)) : null;
+    if (!s?.index) return null;
+    const [i, k] = ref.split(".").map(Number);
+    if (k == null || Number.isNaN(k)) return tileBox(s.index, i);
+    const ps = this.piecesOf(s, i);
+    if (!ps) return tileBox(s.index, i);
+    const o = (ps.first + k) * 4;
+    return [ps.boxes[o], ps.boxes[o + 1], ps.boxes[o + 2], ps.boxes[o + 3]];
   }
 
   /**
@@ -432,23 +576,31 @@ export class PyramidSource {
       }
       return hit;
     }
-    const [path, i] = key.split("#");
+    const [path, ref] = key.split("#");
+    const [i, k] = ref.split(".").map(Number);
     const s = this.byPath.get(path);
     if (!s?.index || !s.footer) return Promise.reject(new Error(`shard not open: ${path}`));
     const footer = s.footer;
+    const piece = k == null || Number.isNaN(k) ? undefined : k;
+    const read: ReadOptions = {
+      ...this.pieces.read,
+      ...(piece != null ? { piece, pieceRows: this.pieceRowsOf(s), pages: !!s.pieceBox } : {}),
+    };
     const { job, promise } = this.pool.submit(
       (id, needsFooter) => ({
         id, type: "decode", url: s.url, bytes: s.entry.bytes, footer: needsFooter ? footer.slice(0) : undefined,
-        tile: Number(i), lod, columns: this.columns, stats: this.pca, vector: this.vector,
+        tile: i, lod, columns: this.columns, stats: this.pca, vector: this.vector, read,
       }),
       s.url,
       urgent,
+      piece != null && !s.pieceBox ? `${s.url}#${i}` : undefined,
     );
     const p = promise.then((out) => {
       const t = out.tile as PackedTile;
       this.stats.tilesDecoded++;
       this.stats.tileBytes += t.fetched;
       this.stats.readMs += t.readMs;
+      this.stats.decodeMs += t.decodeMs ?? 0;
       this.stats.packMs += t.packMs;
       this.stats.statsMs += t.statsMs;
       if (this.jobs.get(key) === job) this.jobs.delete(key);

@@ -32,6 +32,32 @@ Updated 2026-11-12. Design: `docs/design.md`.
   - `setCompressors()` takes decompressors for the worker (zstd for v4).
   - Test fixture `vector-list` (`tools/fixture-vector-list.R`): the vector
     fixture as a list, read tile for tile identically.
+- Same branch, later on 2026-11-12: tiles read in pieces, measured one
+  option at a time on Tiisi's nine store partitions in 2021.
+  - **The test:** the browser tour's eight views, replayed through the
+    source and worker in Node (`test/pieces-bench.test.ts`, skipped
+    unless `PIECES_BENCH` is set). The figures are the warm second pass.
+  - **The options:**
+    - `pieces: "auto"` reads the pieces a file's index declares
+      (`piece_rows`, `piece_bbox_f32`, pages cut at the piece's rows,
+      page index on), one request per column per piece.
+    - `pieces: "probe"` cuts other tiles by their cells.
+    - `read.singleRange` reads a tile in one request.
+    - `read.statsEvery` sets the PCA sample rate.
+  - **Results** (MB, requests, cells packed, worker s):
+    - baseline: 91.8, 258, 2.16 M, 7.8.
+    - PCA 1 row in 16: same, 7.1 (PCA 0.9 to 0.2 s).
+    - one range a tile: 92.3, 111, same, 7.8 to 8.1.
+    - probed pieces: 94.5, 368, 1.45 M, 7.3 (outlines -1 s, probes
+      +1.9 s).
+    - page pieces: 73.3 (paged-file baseline 102.3), 1,767, 1.41 M, 8.0
+      (outlines -1.2 s, reads +1.4 s).
+    - Run-to-run noise is about 0.4 s.
+  - **Files written by parquet-rs are about 12% larger than DuckDB's**
+    whatever the page size (1,042 MB at 16,384-row pages, 1,022 at
+    2,048, DuckDB 929). The writer, not the pages.
+  - **Tests:** `test/pieces.test.ts`: probed pieces rebuild every whole
+    tile of both vector fixtures.
 - Peer dependencies are pinned to deck.gl and luma.gl 9.4.x: the layer uses
   deck.gl internals (listed in the design notes). Test a new minor before
   widening the range.

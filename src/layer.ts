@@ -258,7 +258,7 @@ class PyramidTileLayer extends TileLayer<PackedTile, PyramidTileLayerProps> {
     // tier in view has opened (before that a level selects too few tiles)
     const { source, tier, lod, swap, role } = this.props;
     if (role === "base") return out;
-    const opened = source.opened(tier, viewportBox(this.context.viewport));
+    const opened = source.ready(lod, viewportBox(this.context.viewport));
     // (the tiles' own flags: the layer's isLoaded also waits for sublayers
     // made in this very pass, so a level's last tile would never count)
     swap.report(lod, opened && !!this.state.tileset && loaded === tiles.length, { selected: tiles.length, loaded, cells }, contents);
@@ -312,7 +312,7 @@ function tilesetClass(source: PyramidSource, lod: number, swap: Swap, all = fals
         // nothing until every shard of the tier in view has opened: the
         // budget cannot judge the level before, and a level it then turns
         // down would already be reading
-        this.lastIndices = source.opened(source.tierOf(lod), box) ? source.tilesIn(lod, box).map((t) => ({ i: t.key })) : [];
+        this.lastIndices = source.ready(lod, box) ? source.tilesIn(lod, box).map((t) => ({ i: t.key })) : [];
       }
       return this.lastIndices as any;
     }
