@@ -81,8 +81,11 @@ export const AEF_DECODE = (() => {
 })();
 
 /** Rows a tile's PCA sums are taken from at most: an even sample of a larger
- * tile, scaled to its whole weight, keeps the cost per tile near fixed. */
-export const STATS_ROWS = 4096;
+ * tile, scaled to its whole weight, keeps the cost per tile near fixed. 1,024
+ * of a 16,384-row tile: a view still samples 15 to 90 k cells for 64
+ * dimensions, and the sums cost a quarter of 4,096's (measured 2026-11-12:
+ * 0.9 to 0.2 s of worker time over an eight-view tour). */
+export const STATS_ROWS = 1024;
 
 /** A tile's PCA sums over its vector column, or over its scalar columns.
  * Rows are sampled every `every` rows (default: STATS_ROWS of the tile). */
@@ -196,7 +199,9 @@ export interface ReadOptions {
   piece?: number;
   /** Read the piece's pages alone through the page index (pages aligned to pieces). */
   pages?: boolean;
-  /** The row group's columns in one range request, not one a column chunk. */
+  /** The row group's columns in one range request, not one a column chunk
+   * (default true: 57% fewer requests over a tour, no more bytes to speak
+   * of, since a tile's chunks lie together). */
   singleRange?: boolean;
   /** PCA sums from every `statsEvery`-th row (default: STATS_ROWS a tile). */
   statsEvery?: number;
@@ -279,7 +284,7 @@ async function readRows(s: Shard, tile: number, columns: string[], vector: { nam
   // one range for every wanted column chunk of the group (their chunks lie
   // together), served to hyparquet and the list reader from memory
   let file = counted(s, (b) => (fetched += b));
-  if (opts.singleRange) {
+  if (opts.singleRange ?? true) {
     let lo = Infinity, hi = 0;
     for (const c of rg.columns) {
       const m = c.meta_data!;
