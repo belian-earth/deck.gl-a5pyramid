@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "a5-js": "^1.0.0",
-    "hyparquet": "^1.31.2",
+    "hyparquet": "~1.33.0",
     "zstddec": "^0.2.0"
   },
   "peerDependencies": {

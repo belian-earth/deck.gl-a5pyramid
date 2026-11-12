@@ -77,7 +77,9 @@ export interface ReadTuning {
  * are signed URLs that expire (or superseded files that are deleted): a
  * read refused with HTTP 403, 404 or 410 refreshes the set once and is
  * retried; `compressors`: decompressors for a shard table read on the main
- * thread (beyond snappy).
+ * thread (beyond snappy); `pca`: tiles come with PCA sums, for ScreenPca,
+ * whatever the set's metadata says (default: its `colour` is "pca"), as for a
+ * set an app colours by screen PCA but whose writer left no hint.
  */
 export interface SourceOptions extends ReadTuning {
   workers?: number;
@@ -85,6 +87,7 @@ export interface SourceOptions extends ReadTuning {
   worker?: WorkerFactory;
   refresh?: () => Promise<SetIndex>;
   compressors?: Compressors;
+  pca?: boolean;
 }
 
 /** A shard's name in tile keys. */
@@ -326,7 +329,7 @@ export class PyramidSource {
   };
   /** The set's metadata from its writer (the `a5pyramids` entry), parsed. */
   readonly meta: Record<string, any>;
-  /** Whether tiles come with PCA sums: the set's colour is "pca". */
+  /** Whether tiles come with PCA sums: the `pca` option, else the set's colour is "pca". */
   readonly pca: boolean;
 
   private shards: ShardState[];
@@ -356,7 +359,7 @@ export class PyramidSource {
     } catch {
       this.meta = {};
     }
-    this.pca = this.meta.colour === "pca";
+    this.pca = opts.pca ?? this.meta.colour === "pca";
     // shards listed as empty have no file
     this.shards = set.shards
       .filter((e) => e.path != null || e.url != null)

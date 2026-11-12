@@ -44,7 +44,7 @@
 
 import { CompositeLayer, type GetPickingInfoParams, type Layer, type LayerProps, type PickingInfo, type UpdateParameters } from "@deck.gl/core";
 import { TileLayer, _Tileset2D as Tileset2D } from "@deck.gl/geo-layers";
-import { CodesPolygonLayer, cellKey, type Cover, type Palette } from "./codes-layer.js";
+import { CodesPolygonLayer, ROW_INDEXES, cellKey, type Cover, type Palette } from "./codes-layer.js";
 import { BASE_BUDGET, DEFAULT_BUDGET, chooseLevel, type Budget } from "./budget.js";
 import { boxesMeet, type Box } from "./format.js";
 import { a5Resolution, boxKey, pickLod, viewportBox } from "./tiling.js";
@@ -223,6 +223,19 @@ class Swap {
   hold(ms: number) {
     setTimeout(() => this.redraw(), ms);
   }
+}
+
+/**
+ * The layer's deck.gl extensions and their props (a MaskExtension's
+ * `maskId`, a ClipExtension's `clipBounds`), for the cell layers: deck.gl
+ * hands them down to the tile layers, whose cells are drawn by a layer
+ * built here. Always with ROW_INDEXES, which the cells' colours need.
+ */
+function extensionProps(p: any): Record<string, unknown> {
+  const ext = (p.extensions ?? []) as { constructor: { defaultProps?: Record<string, unknown> } }[];
+  const out: Record<string, unknown> = { extensions: [ROW_INDEXES, ...ext] };
+  for (const e of ext) for (const k of Object.keys(e.constructor.defaultProps ?? {})) if (p[k] !== undefined) out[k] = p[k];
+  return out;
 }
 
 interface PyramidTileLayerProps {
@@ -516,6 +529,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
             opacity: p.opacity,
             extruded: false,
             stroked: false,
+            ...extensionProps(p),
           } as any);
         },
       }),
