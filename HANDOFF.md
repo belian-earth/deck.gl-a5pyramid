@@ -121,12 +121,12 @@ Updated 2026-11-12. Design: `docs/design.md`.
 
 ## Next
 
-0. Store v4 is in (PR #4, merged 2026-11-12). Layer extensions reach the
-   cell layers (branch `layer-extensions`): the ramet47 app masks a job's
+0. Release 0.2.0 (2026-11-12): store v4 (#4) and #5, tagged `v0.2.0` on
+   the version bump's merge. Layer extensions reach the cell layers (#5):
+   the ramet47 app masks a job's
    embeddings to its donor region with a `MaskExtension`; a browser test
    checks nothing is drawn outside the mask (230 sampled pixels drawn there
-   without the change, 0 with it). A tag `v0.2.0` after it merges lets
-   apps pin a release rather than a commit (Hugh's). The same branch sets
+   without the change, 0 with it). Apps pin the `v0.2.0` tag. #5 also sets
    hyparquet to `~1.33.0`: `fixed-list.ts` imports its internals
    (`parquetHeader` from `src/column.js`, exported from 1.33.0 only), so
    `^1.31.2` let an app keep a hyparquet without it (the ramet47 app's
