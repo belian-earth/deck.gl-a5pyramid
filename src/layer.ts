@@ -225,6 +225,20 @@ class Swap {
   }
 }
 
+/**
+ * The layer's deck.gl extensions and their props (a MaskExtension's
+ * `maskId`, a ClipExtension's `clipBounds`), for the cell layers: deck.gl
+ * hands them down to the tile layers, whose cells are drawn by a layer
+ * built here.
+ */
+function extensionProps(p: any): Record<string, unknown> {
+  const ext = (p.extensions ?? []) as { constructor: { defaultProps?: Record<string, unknown> } }[];
+  if (!ext.length) return {};
+  const out: Record<string, unknown> = { extensions: ext };
+  for (const e of ext) for (const k of Object.keys(e.constructor.defaultProps ?? {})) if (p[k] !== undefined) out[k] = p[k];
+  return out;
+}
+
 interface PyramidTileLayerProps {
   /** "base": the base level's layer, which neither reports nor holds. */
   role?: "base";
@@ -516,6 +530,7 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
             opacity: p.opacity,
             extruded: false,
             stroked: false,
+            ...extensionProps(p),
           } as any);
         },
       }),

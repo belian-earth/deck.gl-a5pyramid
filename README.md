@@ -110,7 +110,9 @@ const deck = new Deck({ initialViewState: { longitude: 117.8, latitude: 4.96, zo
 - `A5PyramidLayer` props: `source`, `colouring`, `cellPx` (default 1),
   `budget` (`{ bytes, cells }`, default `DEFAULT_BUDGET`, 40 MB and 1.5 M
   cells), `onStats(stats)` (the levels drawn, their tiles, the view's cost),
-  and deck.gl's `pickable` and `opacity`. Picking gives a `CellInfo`: the
+  and deck.gl's `pickable`, `opacity` and `extensions` (with their props:
+  a `MaskExtension` and `maskId` draw the cells only inside a mask layer).
+  Picking gives a `CellInfo`: the
   cell id, its LOD, `ncell` and its codes.
 - Colourings: `bandColouring(stretch)`, `neutralColouring()`,
   `pcaColouring(basis)`, or `colouring(offset, decode, fill)` for any affine

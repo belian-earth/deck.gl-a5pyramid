@@ -20,3 +20,19 @@ for (const name of ["bands", "vector", "vector-rg", "store-v4"]) {
     expect(r.worst).toBeLessThanOrEqual(1);
   });
 }
+
+// A MaskExtension on the layer reaches its cell layers: nothing is drawn
+// outside the mask.
+test("store-v4: drawn only inside a mask", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  page.on("console", (m) => m.type() === "error" && !m.text().startsWith("Failed to load resource") && errors.push(m.text()));
+  await page.goto("/");
+  await page.waitForFunction(() => typeof (window as any).masked === "function");
+  const r = await page.evaluate((n) => (window as any).masked(n), "store-v4");
+  console.log(JSON.stringify(r));
+  expect(errors).toEqual([]);
+  expect(r.tiles).toBeGreaterThan(0);
+  expect(r.left).toBeGreaterThan(50);
+  expect(r.right).toBe(0);
+});

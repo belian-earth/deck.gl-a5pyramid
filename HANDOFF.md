@@ -121,12 +121,12 @@ Updated 2026-11-12. Design: `docs/design.md`.
 
 ## Next
 
-0. Store v4 (belian-production PR #277): the worker sets a wasm zstd
-   (zstddec measured best) through `setCompressors()`; the source over a
-   job's set; the drawing rule for partial rows. The format gate is at 4
-   (row groups of several tiles); store v4's other format additions
-   (list vectors in the index, `owner`, `weights`, the shard table) will
-   join version 4 in a5pyramid.
+0. Store v4 is in (PR #4, merged 2026-11-12). Layer extensions reach the
+   cell layers (branch `layer-extensions`): the ramet47 app masks a job's
+   embeddings to its donor region with a `MaskExtension`; a browser test
+   checks nothing is drawn outside the mask (230 sampled pixels drawn there
+   without the change, 0 with it). A tag `v0.2.0` after it merges lets
+   apps pin a release rather than a commit (Hugh's).
 1. a5view could load this package instead of its own copy of the lazy
    renderer, one renderer for both.
 2. Propose to deck.gl: abort loading tiles that left the view whatever the
