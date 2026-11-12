@@ -82,7 +82,7 @@ async function check(name: string) {
  * are drawn there and nowhere right of it. Counts of drawn pixels (alpha
  * above 0) sampled on each side, a margin of 20 px left out at the edge.
  */
-async function masked(name: string) {
+async function masked(name: string, withMask = true, pickable = true) {
   const source = await PyramidSource.open(`/${name}/`);
   let stats: RenderStats | null = null;
   const deck = new Deck({
@@ -99,7 +99,7 @@ async function masked(name: string) {
   deck.setProps({
     layers: [
       new SolidPolygonLayer({ id: "half", operation: "mask", data: [{ polygon: half }], getPolygon: (d: { polygon: [number, number][] }) => d.polygon }),
-      new A5PyramidLayer({ id: "p", source, colouring, cellPx: 8, extensions: [new MaskExtension()], maskId: "half", onStats: (s: RenderStats) => (stats = s) } as any),
+      new A5PyramidLayer({ id: "p", source, colouring, cellPx: 8, pickable, ...(withMask ? { extensions: [new MaskExtension()], maskId: "half" } : {}), onStats: (s: RenderStats) => (stats = s) } as any),
     ],
   });
   const t0 = performance.now();
@@ -112,13 +112,15 @@ async function masked(name: string) {
   const dpr = canvas.width / canvas.clientWidth;
   let left = 0, right = 0;
   const px = new Uint8Array(4);
+  const colours: Record<string, number[]> = {};
   for (let y = 20; y < 580; y += 20)
     for (let x = 10; x < 790; x += 20) {
       if (Math.abs(x - 400) < 20) continue;
       gl.readPixels(Math.round(x * dpr), canvas.height - Math.round(y * dpr) - 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
       if (px[3] > 0) x < 400 ? left++ : right++;
+      if (x < 380 && px[3] > 0) colours[`${x},${y}`] = [px[0], px[1], px[2], px[3]];
     }
-  const out = { name, tiles: (stats as RenderStats | null)?.tilesLoaded ?? 0, left, right };
+  const out = { name, tiles: (stats as RenderStats | null)?.tilesLoaded ?? 0, left, right, colours };
   deck.finalize();
   source.close();
   return out;
@@ -126,3 +128,4 @@ async function masked(name: string) {
 
 (window as any).check = check;
 (window as any).masked = masked;
+

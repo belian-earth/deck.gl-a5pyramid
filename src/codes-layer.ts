@@ -26,7 +26,7 @@
 // cell is flat, and at one to two pixels a cell there are about as many
 // vertices as pixels.
 
-import type { UpdateParameters } from "@deck.gl/core";
+import { LayerExtension, type UpdateParameters } from "@deck.gl/core";
 import { SolidPolygonLayer } from "@deck.gl/layers";
 import type { Texture } from "@luma.gl/core";
 import type { ShaderModule } from "@luma.gl/shadertools";
@@ -169,6 +169,22 @@ interface MaskState {
   /** Per finer level, the cellKey of the cell at each centre (NaN: not yet). */
   keys?: Map<number, Float64Array>;
 }
+
+/**
+ * The cell layer finds a cell's codes by its row index, deck.gl's picking
+ * index attribute (`rowIndexes`). deck fills that attribute only for a layer
+ * that needs a picking buffer: for one that is not pickable it is a constant
+ * invalid index, and every cell took one colour. The cell layer carries this
+ * extension so it always has the buffer; a layer that is not pickable is
+ * still never drawn in a picking pass.
+ */
+class RowIndexes extends LayerExtension {
+  static extensionName = "A5PyramidRowIndexes";
+  getNeedsPickingBuffer(): boolean {
+    return true;
+  }
+}
+export const ROW_INDEXES = new RowIndexes();
 
 export class CodesPolygonLayer extends SolidPolygonLayer<any, CodesLayerProps> {
   static layerName = "A5CodesPolygonLayer";

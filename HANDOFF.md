@@ -134,6 +134,13 @@ Updated 2026-11-12. Design: `docs/design.md`.
    And a source option `pca`: tiles carry PCA sums when an app asks,
    whatever the set's metadata says. Store v4's sets carry no `colour`
    hint, so the ramet47 app drew grey until it passed `pca: true`.
+   And `pickable: false` drew every cell one colour: the cell layer reads
+   a cell's codes by deck.gl's picking index (`rowIndexes`), which deck
+   makes a constant invalid index for a layer without a picking buffer.
+   The cell layer now carries `ROW_INDEXES`, an extension whose
+   `getNeedsPickingBuffer()` is true; a browser test compares the colours
+   of a pickable and an unpickable layer (3 distinct colours and a
+   difference of 106 without the extension, identical with it).
 1. a5view could load this package instead of its own copy of the lazy
    renderer, one renderer for both.
 2. Propose to deck.gl: abort loading tiles that left the view whatever the
