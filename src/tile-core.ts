@@ -4,13 +4,12 @@
 // and its tiles are read with range requests from the shard's URL.
 
 import { parquetMetadata, parquetRead, type Compressors, type FileMetaData } from "hyparquet";
-import { cellToBoundary, cellToLonLat } from "a5-js";
+import { cellToBoundary } from "a5-js";
 import { readOffsetIndex } from "hyparquet/src/indexes.js";
 import { readColumn } from "hyparquet/src/column.js";
 import { getTreePath } from "hyparquet/src/schema.js";
 import { DEFAULT_PARSERS } from "hyparquet/src/convert.js";
 import { parquetSchema, type ColumnMetaData } from "hyparquet";
-import { cellSize } from "./tiling.js";
 import { chunkRange, listColumn, readFixedList, type ListColumn } from "./fixed-list.js";
 
 /** A tile ready for deck.gl: binary polygon attributes plus what hover needs. */
@@ -139,6 +138,12 @@ export const FAN_MIN_LOD = 9;
 interface Shard {
   metadata: FileMetaData;
   rowStarts: number[];
+  /** Where each tile is (a5pyramid FORMAT.md, "Tiles"). */
+  tiles: TileLoc[];
+  /** The footer as fetched (the file's last bytes from `footerStart`): in a
+   * set it holds the page index too. */
+  footer: ArrayBuffer;
+  footerStart: number;
   file: RemoteFile;
   /** Each vector column's list layout, null for a fixed binary one. */
   lists: Map<string, ListColumn | null>;
@@ -170,6 +175,32 @@ class RemoteFile {
 
 const shards = new Map<string, Shard>();
 
+/**
+ * Where a tile is: its row group, its first row there and its rows. In a row
+ * group of several tiles (format version 4) the tile is data page `page` of
+ * every column chunk.
+ */
+export interface TileLoc {
+  rowGroup: number;
+  page: number;
+  start: number;
+  rows: number;
+  /** Whether its row group holds other tiles too (read by its pages). */
+  shared: boolean;
+}
+
+/** The tiles of a file whose row groups hold `rows` rows: one a row group,
+ * or with `row_group_size` in the index ceil(rows / tile_size) of them. */
+export function locateTiles(rows: number[], index: { tile_size: number; row_group_size?: number } | null): TileLoc[] {
+  const out: TileLoc[] = [];
+  rows.forEach((n, g) => {
+    const k = index?.row_group_size ? Math.ceil(n / index.tile_size) : 1;
+    const step = k === 1 ? n : index!.tile_size;
+    for (let p = 0; p < k; p++) out.push({ rowGroup: g, page: p, start: p * step, rows: Math.min(step, n - p * step), shared: k > 1 });
+  });
+  return out;
+}
+
 /** Parse a shard's footer (its last `footer_bytes` bytes) and keep it. */
 export function openShard(url: string, byteLength: number, footer: ArrayBuffer): FileMetaData {
   const known = shards.get(url);
@@ -177,7 +208,17 @@ export function openShard(url: string, byteLength: number, footer: ArrayBuffer):
   const metadata = parquetMetadata(footer);
   const rowStarts = [0];
   for (const rg of metadata.row_groups) rowStarts.push(rowStarts[rowStarts.length - 1] + Number(rg.num_rows));
-  shards.set(url, { metadata, rowStarts, file: new RemoteFile(url, byteLength), lists: new Map() });
+  let index = null;
+  try {
+    index = JSON.parse(keyValues(metadata).a5pyramid ?? "null");
+  } catch {
+    // not an a5pyramid file: its row groups are its tiles
+  }
+  const tiles = locateTiles(metadata.row_groups.map((rg) => Number(rg.num_rows)), index);
+  shards.set(url, {
+    metadata, rowStarts, tiles, footer, footerStart: byteLength - footer.byteLength,
+    file: new RemoteFile(url, byteLength), lists: new Map(),
+  });
   return metadata;
 }
 
@@ -194,15 +235,11 @@ export function keyValues(metadata: FileMetaData): Record<string, string> {
 
 /**
  * How a tile is read (the viewer's optimisations of 2026-11-12, measured one
- * by one): as a whole row group, or a piece of it of `pieceRows` rows.
+ * by one). A tile that is its row group is read whole; one of several in its
+ * row group (format version 4) is read by its data pages.
  */
 export interface ReadOptions {
-  /** Rows a piece; with `piece`, the tile's rows [piece * pieceRows, +pieceRows) alone. */
-  pieceRows?: number;
-  piece?: number;
-  /** Read the piece's pages alone through the page index (pages aligned to pieces). */
-  pages?: boolean;
-  /** The row group's columns in one range request, not one a column chunk
+  /** A row group read whole: its columns in one range request, not one a column chunk
    * (default true: 57% fewer requests over a tour, no more bytes to speak
    * of, since a tile's chunks lie together). */
   singleRange?: boolean;
@@ -221,11 +258,6 @@ interface Rows {
   readMs: number;
   decodeMs: number;
 }
-
-/** Row groups decoded in this worker, most recent last: pieces of one tile
- * share a read. */
-const decoded = new Map<string, Promise<Rows>>();
-const DECODED_KEEP = 24;
 
 function cached<T>(m: Map<string, Promise<T>>, key: string, keep: number, make: () => Promise<T>): Promise<T> {
   const hit = m.get(key);
@@ -275,7 +307,8 @@ function flatRows(n: number, chunks: Map<string, ArrayLike<unknown>[]>, columns:
   return { cells, ncell, values };
 }
 
-/** Read a whole row group: every requested column, decoded. */
+/** Read a whole row group: every requested column, decoded (`tile` is the
+ * row group's index). */
 async function readRows(s: Shard, tile: number, columns: string[], vector: { name: string; dim: number } | null, opts: ReadOptions): Promise<Rows> {
   const t0 = performance.now();
   let fetched = 0;
@@ -336,23 +369,29 @@ async function readRows(s: Shard, tile: number, columns: string[], vector: { nam
 }
 
 /** A row group's page locations (the offset index) and dictionary pages,
- * for the columns a piece reads, kept per tile. */
+ * for the columns its tiles read, kept per row group. */
 interface TilePages {
   cols: Map<string, { meta: ColumnMetaData; pages: { offset: number; size: number; first: number }[]; dict: Uint8Array }>;
   fetched: number;
 }
 const tilePages = new Map<string, Promise<TilePages>>();
 
-/** The offset indexes of `names` in row group `tile` (one request: they lie
- * together at the end of the file) and their dictionary pages (one each). */
-async function pagesOf(s: Shard, tile: number, names: string[]): Promise<TilePages> {
-  const rg = s.metadata.row_groups[tile];
+/** The offset indexes of `names` in row group `group` (from the footer as
+ * fetched where it holds them, as a set's does, else one request: they lie
+ * together before the footer) and their dictionary pages (one each). */
+async function pagesOf(s: Shard, group: number, names: string[]): Promise<TilePages> {
+  const rg = s.metadata.row_groups[group];
   const cols = rg.columns.filter((c) => names.includes(c.meta_data!.path_in_schema[0]));
-  if (cols.some((c) => c.offset_index_offset == null)) throw new Error("no page index: pieces need one");
+  if (cols.some((c) => c.offset_index_offset == null)) throw new Error(`row group ${group} holds several tiles but has no page index`);
   const lo = Math.min(...cols.map((c) => Number(c.offset_index_offset)));
   const hi = Math.max(...cols.map((c) => Number(c.offset_index_offset) + Number(c.offset_index_length)));
-  const buf = await s.file.slice(lo, hi);
-  let fetched = buf.byteLength;
+  let fetched = 0;
+  let buf: ArrayBuffer;
+  if (lo >= s.footerStart) buf = s.footer.slice(lo - s.footerStart, hi - s.footerStart);
+  else {
+    buf = await s.file.slice(lo, hi);
+    fetched += buf.byteLength;
+  }
   const out: TilePages["cols"] = new Map();
   await Promise.all(cols.map(async (c) => {
     const meta = c.meta_data!;
@@ -371,33 +410,34 @@ async function pagesOf(s: Shard, tile: number, names: string[]): Promise<TilePag
   return { cols: out, fetched };
 }
 
-/** Read piece `piece` of a row group whose pages are cut at the piece's rows:
- * one request a column for its page (the tile's page index and dictionaries
- * read once a worker), flat columns decoded by hyparquet, the list vector by
- * the flat list reader. */
-async function readPiecePages(s: Shard, url: string, tile: number, piece: number, pieceRows: number, columns: string[],
+/** Read a tile that is one data page of every column chunk of its row group:
+ * one request a column for its page (the row group's page index and
+ * dictionaries read once a worker), flat columns decoded by hyparquet, the
+ * list vector by the flat list reader. */
+async function readTilePages(s: Shard, url: string, loc: TileLoc, columns: string[],
   vector: { name: string; dim: number } | null): Promise<Rows> {
   const t0 = performance.now();
   const list = vectorList(s, vector);
   if (s.hasNcell === undefined) s.hasNcell = s.metadata.schema.some((e) => e.name === "ncell");
   s.tree ??= parquetSchema(s.metadata);
-  const tileRows = s.rowStarts[tile + 1] - s.rowStarts[tile];
-  const r0 = piece * pieceRows;
-  const n = Math.min(pieceRows, tileRows - r0);
+  const tile = loc.rowGroup;
+  const groupRows = s.rowStarts[tile + 1] - s.rowStarts[tile];
+  const r0 = loc.start;
+  const n = loc.rows;
   const flat = ["cell", ...(s.hasNcell ? ["ncell"] : []), ...columns, ...(vector && !list ? [vector.name] : [])];
   const names = [...flat, ...(list ? [vector!.name] : [])];
   let first = false;
   const tp = await cached(tilePages, `${url}#${tile}`, 64, () => ((first = true), pagesOf(s, tile, names)));
   let fetched = first ? tp.fetched : 0;
-  // each column's page of the piece, all at once
+  // each column's page of the tile, all at once
   const bytes = new Map<string, Uint8Array>();
   await Promise.all(names.map(async (name) => {
     const c = tp.cols.get(name);
     if (!c) throw new Error(`no column ${name}`);
-    const k = c.pages.findIndex((l) => l.first === r0);
-    if (k < 0) throw new Error(`no page of ${name} starts at row ${r0} of tile ${tile}: pages are not cut at ${pieceRows} rows`);
-    const end = k + 1 < c.pages.length ? c.pages[k + 1].first : tileRows;
-    if (end - r0 !== n) throw new Error(`page ${k} of ${name} holds ${end - r0} rows, the piece ${n}`);
+    const k = loc.page;
+    if (c.pages[k]?.first !== r0) throw new Error(`page ${k} of ${name} in row group ${tile} does not start at row ${r0}: its pages are not the tiles`);
+    const end = k + 1 < c.pages.length ? c.pages[k + 1].first : groupRows;
+    if (end - r0 !== n) throw new Error(`page ${k} of ${name} in row group ${tile} holds ${end - r0} rows, its tile ${n}`);
     const page = new Uint8Array(await s.file.slice(c.pages[k].offset, c.pages[k].offset + c.pages[k].size));
     fetched += page.byteLength;
     const both = new Uint8Array(c.dict.length + page.length);
@@ -484,71 +524,19 @@ function packRows(r: Rows, a: number, b: number, lod: number, dimOrNull: number 
   };
 }
 
-/** Read tile `tile` (row group) of an open shard, or a piece of it, and pack it. */
+/** Read tile `tile` of an open shard (its row group, or its pages of a row
+ * group of several tiles) and pack it. */
 export async function readTile(
   url: string, tile: number, lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
   opts: ReadOptions = {},
 ): Promise<PackedTile> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
-  const n = s.rowStarts[tile + 1] - s.rowStarts[tile];
+  const loc = s.tiles[tile];
+  if (!loc) throw new Error(`${url} has no tile ${tile}`);
   const dim = vector ? vector.dim : null;
-  if (opts.pieceRows && opts.piece != null) {
-    // a piece samples its PCA rows as densely as a 16,384-row tile would
-    // (whatever its row group's size)
-    const statsEvery = opts.statsEvery ?? Math.max(1, Math.ceil(Math.min(n, STATS_TILE) / STATS_ROWS));
-    opts = { ...opts, statsEvery, piece: opts.piece, pieceRows: opts.pieceRows };
-    const piece = opts.piece!, pieceRows = opts.pieceRows!;
-    const a = piece * pieceRows, b = Math.min(n, a + pieceRows);
-    if (opts.pages) {
-      const r = await readPiecePages(s, url, tile, piece, pieceRows, columns, vector);
-      return packRows(r, 0, r.n, lod, dim, withStats, statsEvery, r);
-    }
-    // the row group read once a worker; the first piece carries its cost
-    let first = false;
-    const r = await cached(decoded, `${url}#${tile}`, DECODED_KEEP, () => ((first = true), readRows(s, tile, columns, vector, opts)));
-    return packRows(r, a, b, lod, dim, withStats, statsEvery, first ? r : { fetched: 0, readMs: 0, decodeMs: 0 });
-  }
-  const r = await readRows(s, tile, columns, vector, opts);
-  return packRows(r, 0, n, lod, dim, withStats, opts.statsEvery, r);
-}
-
-/**
- * Boxes of a row group's pieces of `pieceRows` rows, from the centres of
- * every `sample`-th cell, widened by `sample` cells and one more: the cells
- * between two samples lie along the A5 curve, within that of them.
- */
-export async function probeTile(url: string, tile: number, lod: number, pieceRows: number, sample = 4): Promise<{ boxes: Float32Array; fetched: number; ms: number }> {
-  const s = shards.get(url);
-  if (!s) throw new Error(`shard not open: ${url}`);
-  const t0 = performance.now();
-  let fetched = 0;
-  const n = s.rowStarts[tile + 1] - s.rowStarts[tile];
-  const cells: bigint[] = [];
-  await parquetRead({
-    file: counted(s, (b) => (fetched += b)), metadata: s.metadata, compressors,
-    rowStart: s.rowStarts[tile], rowEnd: s.rowStarts[tile + 1], columns: ["cell"],
-    onChunk: (c) => {
-      const d = c.columnData as ArrayLike<unknown>;
-      for (let i = 0; i < d.length; i++) cells.push(typeof d[i] === "bigint" ? BigInt.asUintN(64, d[i] as bigint) : BigInt(d[i] as number));
-    },
-  });
-  const pieces = Math.ceil(n / pieceRows);
-  const boxes = new Float32Array(pieces * 4);
-  const pad = (sample + 1) * cellSize(lod);
-  for (let p = 0; p < pieces; p++) {
-    let w = Infinity, so = Infinity, e = -Infinity, no = -Infinity;
-    const a = p * pieceRows, b = Math.min(n, a + pieceRows);
-    for (let i = a; i < b; i += sample) {
-      const [lon, lat] = cellToLonLat(cells[i]);
-      w = Math.min(w, lon); e = Math.max(e, lon); so = Math.min(so, lat); no = Math.max(no, lat);
-    }
-    const [lon, lat] = cellToLonLat(cells[b - 1]);
-    w = Math.min(w, lon); e = Math.max(e, lon); so = Math.min(so, lat); no = Math.max(no, lat);
-    const dLat = pad / 110574, dLon = dLat / Math.max(0.05, Math.cos(((so + no) / 2) * Math.PI / 180));
-    boxes.set([w - dLon, so - dLat, e + dLon, no + dLat], p * 4);
-  }
-  return { boxes, fetched, ms: performance.now() - t0 };
+  const r = loc.shared ? await readTilePages(s, url, loc, columns, vector) : await readRows(s, loc.rowGroup, columns, vector, opts);
+  return packRows(r, 0, r.n, lod, dim, withStats, opts.statsEvery, r);
 }
 
 function copyInto<T>(out: { [i: number]: T; length: number }, parts: ArrayLike<unknown>[], conv: (v: unknown) => T) {
@@ -606,7 +594,6 @@ export function transferables(t: PackedTile): ArrayBuffer[] {
 /** A message to a decode worker. */
 export type WorkerRequest =
   | { id: number; type: "index"; url: string; bytes: number; footer: ArrayBuffer }
-  | { id: number; type: "probe"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number; pieceRows: number }
   | {
       id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number;
       columns: string[]; stats?: boolean; vector?: { name: string; dim: number } | null; read?: ReadOptions;
@@ -614,24 +601,24 @@ export type WorkerRequest =
 
 /**
  * What a worker does with a message: open a shard (its index, and each
- * tile's rows and compressed bytes, for the view budget) or read a tile.
- * The reply echoes the id, with a result or an error.
+ * tile's row group, rows and compressed bytes, for the view budget) or read
+ * a tile. The reply echoes the id, with a result or an error.
  */
 export async function handleRequest(m: WorkerRequest): Promise<{ reply: Record<string, unknown>; transfer: ArrayBuffer[] }> {
   try {
     if (m.type === "index") {
       const md = openShard(m.url, m.bytes, m.footer);
-      const tileRows = md.row_groups.map((rg) => Number(rg.num_rows));
-      const tileBytes = md.row_groups.map((rg) => rg.columns.reduce((a, c) => a + Number(c.meta_data?.total_compressed_size ?? 0), 0));
-      return { reply: { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes }, transfer: [] };
+      const tiles = shards.get(m.url)!.tiles;
+      const groupBytes = md.row_groups.map((rg) => rg.columns.reduce((a, c) => a + Number(c.meta_data?.total_compressed_size ?? 0), 0));
+      const tileRows = tiles.map((t) => t.rows);
+      // a tile of a shared row group: its share of the group's bytes
+      const tileBytes = tiles.map((t) => groupBytes[t.rowGroup] * (t.shared ? t.rows / Number(md.row_groups[t.rowGroup].num_rows) : 1));
+      const tileGroup = tiles.map((t) => (t.shared ? t.rowGroup : -1));
+      return { reply: { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes, tileGroup }, transfer: [] };
     }
     if (!hasShard(m.url)) {
       if (!m.footer) throw new Error(`no footer for ${m.url}`);
       openShard(m.url, m.bytes, m.footer);
-    }
-    if (m.type === "probe") {
-      const p = await probeTile(m.url, m.tile, m.lod, m.pieceRows);
-      return { reply: { id: m.id, probe: p }, transfer: [p.boxes.buffer as ArrayBuffer] };
     }
     const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {});
     return { reply: { id: m.id, tile }, transfer: transferables(tile) };

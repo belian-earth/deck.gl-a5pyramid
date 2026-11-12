@@ -1,23 +1,28 @@
-// The viewer's optimisations of 2026-11-12, measured one against another on
-// a local store v4 set (PIECES_DATA: a directory holding tiisi/ and
-// tiisi-pages/ year=2021 sets; ZSTDDEC: zstddec's ESM build). Skipped unless
-// PIECES_BENCH is set:
+// The browser tour over local store v4 sets, one layout or read setting
+// against another (TOUR_DATA: a directory of year=2021 sets; ZSTDDEC:
+// zstddec's ESM build). Skipped unless TOUR_BENCH is set:
 //
-//   PIECES_BENCH=1 PIECES_DATA=... ZSTDDEC=... npx vitest run test/pieces-bench.test.ts
+//   TOUR_BENCH=1 TOUR_DATA=... ZSTDDEC=... npx vitest run test/tour-bench.test.ts
+//
+// The sets of 2026-11-12 (Tiisi's nine store partitions, ramet branch
+// store-v4, dev/bench/v4) were deleted after the row-group decision; rebuild
+// them to run this. The decision's figures (MB, requests, worker s): 16,384-row
+// groups 92.3, 111, 7.0; 131,072-row groups with 16,384-row pages read as
+// tiles 90.9, 258, 6.8; the same read whole 213.2, 43, 15.1.
 //
 // The views are the browser tour's, at its levels, in a 1036 × 663 px map,
 // one source a variant so tiles cached by earlier steps are reused as they
 // would be. Worker time is in-process, one core.
 import { describe, expect, it } from "vitest";
 import { openSync, readSync, statSync } from "node:fs";
-import { PyramidSource, type PieceOptions } from "../src/source.js";
+import { PyramidSource, type ReadTuning } from "../src/source.js";
 import { setCompressors, type PackedTile } from "../src/tile-core.js";
 import { metresPerPixel } from "../src/tiling.js";
 import type { Box } from "../src/format.js";
 import { localWorker } from "./helpers.js";
 
-const DATA = process.env.PIECES_DATA ?? "";
-const ORIGIN = "http://pieces.test/";
+const DATA = process.env.TOUR_DATA ?? "";
+const ORIGIN = "http://tour.test/";
 const W = 1036, H = 663;
 const STEPS: { name: string; center: [number, number]; zoom: number; lod: number }[] = [
   { name: "Tiisi", center: [-1.0, 10.1], zoom: 7.6, lod: 13 },
@@ -63,7 +68,7 @@ async function until(f: () => boolean) {
   for (let i = 0; i < 20000 && !f(); i++) await new Promise((r) => setTimeout(r, 2));
 }
 
-async function runTour(set: string, opts: PieceOptions) {
+async function runTour(set: string, opts: ReadTuning) {
   const source = await PyramidSource.open(`${ORIGIN}${set}/year=2021/`, { worker: localWorker, workers: 4, ...opts });
   const rows: Record<string, number | string>[] = [];
   const seen = new Set<string>();
@@ -85,8 +90,8 @@ async function runTour(set: string, opts: PieceOptions) {
       cells: tiles.reduce((a, t) => a + t.n, 0),
       MB: +((served.bytes - b0) / 1e6).toFixed(2), requests: served.requests - r0,
       read: Math.round(d("readMs")), decode: Math.round(d("decodeMs")), pack: Math.round(d("packMs")),
-      pca: Math.round(d("statsMs")), probe: Math.round(d("probeMs")),
-      cpu: Math.round(d("readMs") + d("decodeMs") + d("packMs") + d("statsMs") + d("probeMs")),
+      pca: Math.round(d("statsMs")),
+      cpu: Math.round(d("readMs") + d("decodeMs") + d("packMs") + d("statsMs")),
       wall: Math.round(wall),
     });
   }
@@ -94,30 +99,20 @@ async function runTour(set: string, opts: PieceOptions) {
   return rows;
 }
 
-describe.skipIf(!process.env.PIECES_BENCH)("pieces benchmark", () => {
+describe.skipIf(!process.env.TOUR_BENCH)("tour benchmark", () => {
   it("measures the tour under each variant", async () => {
     installLocalFetch();
     const { ZSTDDecoder } = await import(process.env.ZSTDDEC!);
     const zd = new ZSTDDecoder();
     await zd.init();
     setCompressors({ ZSTD: (i: Uint8Array, n: number) => zd.decode(i, n) });
-    // PIECES_VARIANTS=rg: the row-group decision of 2026-11-12 (ramet wants
-    // large row groups; the viewer pieces of 16,384 rows)
-    const variants: [string, string, PieceOptions][] = process.env.PIECES_VARIANTS === "rg" ? [
-      ["16,384-row groups (defaults: one range, PCA 1/16)", "tiisi", { pieces: "off" }],
-      ["131,072-row groups, pages of 16,384 read as pieces", "tiisi-rg", { pieces: "auto" }],
-      ["131,072-row groups read whole", "tiisi-rg", { pieces: "off" }],
-    ] : [
-      ["baseline", "tiisi", { pieces: "off", read: { singleRange: false, statsEvery: 4 } }],
-      ["3: PCA 1/16", "tiisi", { pieces: "off", read: { singleRange: false, statsEvery: 16 } }],
-      ["4: one range a tile", "tiisi", { pieces: "off", read: { singleRange: true, statsEvery: 4 } }],
-      ["2: probed pieces", "tiisi", { pieces: "probe", pieceRows: 2048, read: { singleRange: false, statsEvery: 4 } }],
-      ["2-4: probed pieces, one range, PCA 1/16", "tiisi", { pieces: "probe", pieceRows: 2048, read: { singleRange: true, statsEvery: 16 } }],
-      ["3 + 4", "tiisi", { pieces: "off", read: { singleRange: true, statsEvery: 16 } }],
-      ["baseline on the paged files", "tiisi-pages", { pieces: "off", read: { singleRange: false, statsEvery: 4 } }],
-      ["1: index pieces, page reads", "tiisi-pages", { pieces: "auto", read: { statsEvery: 4 } }],
-      ["1 + 3: and PCA 1/16", "tiisi-pages", { pieces: "auto", read: { statsEvery: 16 } }],
-    ];
+    // TOUR_SETS: the sets to compare, comma separated (default: tiisi, one
+    // tile a row group, and tiisi-v4, format version 4)
+    const sets = (process.env.TOUR_SETS ?? "tiisi,tiisi-v4").split(",");
+    const variants: [string, string, ReadTuning][] = sets.flatMap((set): [string, string, ReadTuning][] => [
+      [`${set} (defaults: one range a row group, PCA 1/16)`, set, {}],
+      [`${set}, a request a column chunk`, set, { read: { singleRange: false } }],
+    ]);
     const out: string[] = [];
     // a first pass warms the JIT and the page cache; the second is reported
     for (const [, set, opts] of variants) await runTour(set, opts);
@@ -126,10 +121,10 @@ describe.skipIf(!process.env.PIECES_BENCH)("pieces benchmark", () => {
       const total = (k: string) => rows.reduce((a, r) => a + (r[k] as number), 0);
       out.push(`\n== ${name}\n` + rows.map((r) => Object.entries(r).map(([k, v]) => `${k} ${v}`).join(", ")).join("\n") +
         `\nTOTAL MB ${total("MB").toFixed(1)}, requests ${total("requests")}, cells ${total("cells")}, cpu ${total("cpu")} ms ` +
-        `(read ${total("read")}, decode ${total("decode")}, pack ${total("pack")}, pca ${total("pca")}, probe ${total("probe")})`);
+        `(read ${total("read")}, decode ${total("decode")}, pack ${total("pack")}, pca ${total("pca")})`);
     }
     const { writeFileSync } = await import("node:fs");
-    writeFileSync(process.env.PIECES_OUT ?? "/dev/stdout", out.join("\n") + "\n");
+    writeFileSync(process.env.TOUR_OUT ?? "/dev/stdout", out.join("\n") + "\n");
     expect(out.length).toBe(variants.length);
   }, 1_800_000);
 });

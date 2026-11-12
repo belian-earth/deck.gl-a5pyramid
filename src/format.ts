@@ -1,4 +1,5 @@
-// The a5pyramid set format (a5pyramid FORMAT.md, "Pyramid sets"; version 3 adds vector columns):
+// The a5pyramid set format (a5pyramid FORMAT.md, "Pyramid sets"; version 3 adds vector columns,
+// version 4 row groups of several tiles, each tile a data page):
 // set.json and each shard's index, as this reader takes them.
 
 /** `[west, south, east, north]` in degrees; `west > east` crosses the antimeridian. */
@@ -8,6 +9,8 @@ export interface Tier {
   lods: [number, number];
   shard_resolution: number;
   tile_size: number;
+  /** Format version 4: the most rows in a row group of several tiles. */
+  row_group_size?: number;
 }
 
 export interface ShardEntry {
@@ -56,6 +59,9 @@ export interface PyramidIndex {
   format_version: number;
   data_resolution: number;
   tile_size: number;
+  /** Format version 4: the most rows in a row group, which holds
+   * ceil(rows / tile_size) tiles, each one data page of every column. */
+  row_group_size?: number;
   bbox: Box;
   columns: ColumnMeta[];
   levels: LevelMeta[];
@@ -64,7 +70,7 @@ export interface PyramidIndex {
 }
 
 /** The newest format version this reader reads, and the A5 index of a5-js 1.x. */
-export const FORMAT_VERSION = 3;
+export const FORMAT_VERSION = 4;
 export const A5_INDEX = "1.0";
 
 export function checkSet(s: SetIndex): SetIndex {
