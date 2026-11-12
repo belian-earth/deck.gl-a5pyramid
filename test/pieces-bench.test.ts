@@ -101,15 +101,21 @@ describe.skipIf(!process.env.PIECES_BENCH)("pieces benchmark", () => {
     const zd = new ZSTDDecoder();
     await zd.init();
     setCompressors({ ZSTD: (i: Uint8Array, n: number) => zd.decode(i, n) });
-    const variants: [string, string, PieceOptions][] = [
-      ["baseline", "tiisi", { pieces: "off" }],
-      ["3: PCA 1/16", "tiisi", { pieces: "off", read: { statsEvery: 16 } }],
-      ["4: one range a tile", "tiisi", { pieces: "off", read: { singleRange: true } }],
-      ["2: probed pieces", "tiisi", { pieces: "probe", pieceRows: 2048 }],
+    // PIECES_VARIANTS=rg: the row-group decision of 2026-11-12 (ramet wants
+    // large row groups; the viewer pieces of 16,384 rows)
+    const variants: [string, string, PieceOptions][] = process.env.PIECES_VARIANTS === "rg" ? [
+      ["16,384-row groups (defaults: one range, PCA 1/16)", "tiisi", { pieces: "off" }],
+      ["131,072-row groups, pages of 16,384 read as pieces", "tiisi-rg", { pieces: "auto" }],
+      ["131,072-row groups read whole", "tiisi-rg", { pieces: "off" }],
+    ] : [
+      ["baseline", "tiisi", { pieces: "off", read: { singleRange: false, statsEvery: 4 } }],
+      ["3: PCA 1/16", "tiisi", { pieces: "off", read: { singleRange: false, statsEvery: 16 } }],
+      ["4: one range a tile", "tiisi", { pieces: "off", read: { singleRange: true, statsEvery: 4 } }],
+      ["2: probed pieces", "tiisi", { pieces: "probe", pieceRows: 2048, read: { singleRange: false, statsEvery: 4 } }],
       ["2-4: probed pieces, one range, PCA 1/16", "tiisi", { pieces: "probe", pieceRows: 2048, read: { singleRange: true, statsEvery: 16 } }],
       ["3 + 4", "tiisi", { pieces: "off", read: { singleRange: true, statsEvery: 16 } }],
-      ["baseline on the paged files", "tiisi-pages", { pieces: "off" }],
-      ["1: index pieces, page reads", "tiisi-pages", { pieces: "auto" }],
+      ["baseline on the paged files", "tiisi-pages", { pieces: "off", read: { singleRange: false, statsEvery: 4 } }],
+      ["1: index pieces, page reads", "tiisi-pages", { pieces: "auto", read: { statsEvery: 4 } }],
       ["1 + 3: and PCA 1/16", "tiisi-pages", { pieces: "auto", read: { statsEvery: 16 } }],
     ];
     const out: string[] = [];

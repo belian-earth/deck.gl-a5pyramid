@@ -86,6 +86,9 @@ export const AEF_DECODE = (() => {
  * dimensions, and the sums cost a quarter of 4,096's (measured 2026-11-12:
  * 0.9 to 0.2 s of worker time over an eight-view tour). */
 export const STATS_ROWS = 1024;
+/** The tile size STATS_ROWS is set for: a larger tile or row group samples
+ * no more sparsely than one of these. */
+export const STATS_TILE = 16384;
 
 /** A tile's PCA sums over its vector column, or over its scalar columns.
  * Rows are sampled every `every` rows (default: STATS_ROWS of the tile). */
@@ -95,7 +98,7 @@ export function tileStats(t: { values: Int8Array[]; vector: Int8Array | null; di
   const sum = new Float64Array(d);
   const cross = new Float64Array((d * (d + 1)) / 2);
   const x = new Float64Array(d);
-  const step = Math.max(1, every ?? Math.ceil(n / STATS_ROWS));
+  const step = Math.max(1, every ?? Math.ceil(Math.min(n, STATS_TILE) / STATS_ROWS));
   let wAll = 0;
   for (let i = 0; i < n; i++) wAll += ncell[i];
   let wSample = 0;
@@ -491,8 +494,9 @@ export async function readTile(
   const n = s.rowStarts[tile + 1] - s.rowStarts[tile];
   const dim = vector ? vector.dim : null;
   if (opts.pieceRows && opts.piece != null) {
-    // a piece samples its PCA rows as densely as its whole tile would
-    const statsEvery = opts.statsEvery ?? Math.max(1, Math.ceil(n / STATS_ROWS));
+    // a piece samples its PCA rows as densely as a 16,384-row tile would
+    // (whatever its row group's size)
+    const statsEvery = opts.statsEvery ?? Math.max(1, Math.ceil(Math.min(n, STATS_TILE) / STATS_ROWS));
     opts = { ...opts, statsEvery, piece: opts.piece, pieceRows: opts.pieceRows };
     const piece = opts.piece!, pieceRows = opts.pieceRows!;
     const a = piece * pieceRows, b = Math.min(n, a + pieceRows);
