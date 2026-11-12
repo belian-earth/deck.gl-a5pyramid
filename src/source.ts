@@ -16,8 +16,10 @@ import {
   type SetIndex,
   type ShardEntry,
 } from "./format.js";
-import type { PackedTile } from "./tile-core.js";
+import type { PackedTile, ReadOptions } from "./tile-core.js";
+import { readSetTable } from "./set-table.js";
 import { boxKey } from "./tiling.js";
+import type { Compressors } from "hyparquet";
 
 /** A box meeting every tile. */
 export const WORLD: Box = [-180, -90, 180, 90];
@@ -35,12 +37,16 @@ export const defaultWorker: WorkerFactory = () => new Worker(new URL("./worker.j
 
 interface ShardState {
   entry: ShardEntry;
+  /** Its name in tile keys: its path, or its tier and cell. */
+  key: string;
   url: string;
   footer?: ArrayBuffer;
   index?: PyramidIndex;
-  /** Rows and compressed bytes of each tile (row group), from the footer. */
+  /** Rows and compressed bytes of each tile, from the footer, and the row
+   * group of each tile that shares one (format version 4; -1 otherwise). */
   tileRows?: number[];
   tileBytes?: number[];
+  tileGroup?: number[];
   opening?: Promise<void>;
   failed?: string;
 }
@@ -52,6 +58,45 @@ export interface TileRef {
   box: Box;
 }
 
+/**
+ * How tiles are read (the viewer's optimisations of 2026-11-12): one range
+ * request a row group read whole, and the PCA sample rate. `merge`: tiles of
+ * one row group that a view asks for together share one request a column
+ * (default true).
+ */
+export interface ReadTuning {
+  read?: Pick<ReadOptions, "singleRange" | "statsEvery">;
+  merge?: boolean;
+}
+
+/**
+ * How a source is opened. `workers`: decode workers (default: CPUs less
+ * two, 2 to 4); `cacheBytes`: decoded tiles kept, least recently used
+ * dropped first (default 512 MB); `worker`: how to make a worker (default
+ * the bundled one); `refresh`: fetch the set again, for a set whose files
+ * are signed URLs that expire (or superseded files that are deleted): a
+ * read refused with HTTP 403, 404 or 410 refreshes the set once and is
+ * retried; `compressors`: decompressors for a shard table read on the main
+ * thread (beyond snappy).
+ */
+export interface SourceOptions extends ReadTuning {
+  workers?: number;
+  cacheBytes?: number;
+  worker?: WorkerFactory;
+  refresh?: () => Promise<SetIndex>;
+  compressors?: Compressors;
+}
+
+/** A shard's name in tile keys. */
+function shardKey(e: ShardEntry): string {
+  return e.path ?? `tier=${e.tier}/shard=${e.cell}`;
+}
+
+/** Whether a read failed for a URL that has expired or gone. */
+function gone(e: unknown): boolean {
+  return /HTTP (403|404|410)\b/.test(String((e as Error)?.message ?? e));
+}
+
 export interface SourceStats {
   cancelled: number;
   shardsOpen: number;
@@ -59,6 +104,8 @@ export interface SourceStats {
   tileBytes: number;
   tilesDecoded: number;
   readMs: number;
+  /** Worker time decoding vectors and filling codes textures. */
+  decodeMs: number;
   packMs: number;
   /** Worker time spent on tiles' PCA sums. */
   statsMs: number;
@@ -81,6 +128,13 @@ interface Job {
   /** Its batch (one per task that submitted jobs) and order of submission. */
   batch: number;
   seq: number;
+  /** Jobs of one affinity (the tiles of one row group) go to the worker that
+   * ran the last of them when it has room: it holds the row group's page
+   * index and dictionaries. */
+  affinity?: string;
+  /** A tile read that can share one request with other queued tiles of its
+   * affinity: `n` its tile, `merge` the request for several. */
+  tile?: { n: number; merge: (id: number, needsFooter: boolean, tiles: number[]) => WorkerRequest };
 }
 
 /**
@@ -96,8 +150,11 @@ interface Job {
  */
 class Pool {
   static PER_WORKER = 2;
+  /** The most tiles of one row group read in one request. */
+  static MERGE = 8;
   private workers: { w: Worker; busy: number; shards: Set<string> }[] = [];
-  private running = new Map<number, { job: Job; slot: number }>();
+  private running = new Map<number, { jobs: Job[]; slot: number }>();
+  private pumping = false;
   private queue: Job[] = [];
   private urgent: Job[] = [];
   private urgentRunning = 0;
@@ -115,9 +172,10 @@ class Pool {
         if (!r) return;
         this.running.delete(ev.data.id);
         this.workers[slot].busy--;
-        if (r.job.urgent) this.urgentRunning--;
-        if (ev.data.error) r.job.reject(new Error(ev.data.error));
-        else r.job.resolve(ev.data);
+        if (r.jobs[0].urgent) this.urgentRunning--;
+        if (ev.data.error) for (const j of r.jobs) j.reject(new Error(ev.data.error));
+        else if (ev.data.tiles) r.jobs.forEach((j, k) => j.resolve({ ...ev.data, tile: ev.data.tiles[k] }));
+        else r.jobs[0].resolve(ev.data);
         this.pump();
       };
       this.workers.push({ w, busy: 0, shards: new Set() });
@@ -137,15 +195,26 @@ class Pool {
     return this.queue.length + this.urgent.length;
   }
 
-  submit(build: Job["build"], shard: string, urgent = false): { job: Job; promise: Promise<any> } {
+  submit(build: Job["build"], shard: string, urgent = false, affinity?: string, tile?: Job["tile"]): { job: Job; promise: Promise<any> } {
     let job!: Job;
     const promise = new Promise<any>((resolve, reject) => {
-      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent, batch: 0, seq: 0 };
+      job = { build, shard, resolve, reject, waiters: 1, started: false, urgent, batch: 0, seq: 0, affinity, tile };
     });
     this.stamp(job);
     (urgent ? this.urgent : this.queue).push(job);
-    this.pump();
+    this.schedule();
     return { job, promise };
+  }
+
+  /** Dispatch once the current task has queued its jobs, so a view's tiles
+   * of one row group can share a request. */
+  private schedule() {
+    if (this.pumping) return;
+    this.pumping = true;
+    queueMicrotask(() => {
+      this.pumping = false;
+      this.pump();
+    });
   }
 
   /** Move a queued job to the front of its line (the end), or into the urgent one. */
@@ -158,7 +227,7 @@ class Pool {
     job.urgent ||= urgent;
     this.stamp(job);
     (job.urgent ? this.urgent : this.queue).push(job);
-    this.pump();
+    this.schedule();
   }
 
   /** Drop a job not yet started. */
@@ -192,6 +261,8 @@ class Pool {
     return line.splice(best, 1)[0];
   }
 
+  private affine = new Map<string, number>();
+
   private pump() {
     while (this.urgent.length || (this.queue.length && !this.urgentRunning)) {
       let slot = -1;
@@ -200,21 +271,36 @@ class Pool {
       }
       if (slot < 0) return;
       const job = this.take(this.urgent.length ? this.urgent : this.queue);
-      job.started = true;
+      if (job.affinity != null) {
+        const pref = this.affine.get(job.affinity);
+        if (pref != null && this.workers[pref].busy < Pool.PER_WORKER) slot = pref;
+        if (this.affine.size > 4096) this.affine.clear();
+        this.affine.set(job.affinity, slot);
+      }
+      // the other queued tiles of its row group go with it
+      const jobs = [job];
+      if (job.tile && job.affinity != null) {
+        const line = job.urgent ? this.urgent : this.queue;
+        for (let i = 0; i < line.length && jobs.length < Pool.MERGE; ) {
+          if (line[i].affinity === job.affinity && line[i].tile) jobs.push(line.splice(i, 1)[0]);
+          else i++;
+        }
+      }
+      for (const j of jobs) j.started = true;
       if (job.urgent) this.urgentRunning++;
       const w = this.workers[slot];
       const id = this.next++;
       const needsFooter = !w.shards.has(job.shard);
       w.shards.add(job.shard);
       w.busy++;
-      this.running.set(id, { job, slot });
-      w.w.postMessage(job.build(id, needsFooter));
+      this.running.set(id, { jobs, slot });
+      w.w.postMessage(jobs.length > 1 ? job.tile!.merge(id, needsFooter, jobs.map((j) => j.tile!.n)) : job.build(id, needsFooter));
     }
   }
 
   terminate() {
     for (const { w } of this.workers) w.terminate();
-    for (const { job } of this.running.values()) job.reject(new Error("pyramid closed"));
+    for (const { jobs } of this.running.values()) for (const job of jobs) job.reject(new Error("pyramid closed"));
     for (const job of [...this.queue, ...this.urgent]) job.reject(new Error("pyramid closed"));
     this.running.clear();
     this.queue = [];
@@ -235,7 +321,8 @@ export class PyramidSource {
   /** Called when a shard opens; the layer redraws. */
   onChange: (() => void) | null = null;
   readonly stats: SourceStats = {
-    cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, packMs: 0, statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
+    cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, decodeMs: 0, packMs: 0,
+    statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
   };
   /** The set's metadata from its writer (the `a5pyramids` entry), parsed. */
   readonly meta: Record<string, any>;
@@ -249,7 +336,16 @@ export class PyramidSource {
   private sizes = new Map<string, number>();
   private pool: Pool;
 
-  private constructor(readonly base: string, readonly set: SetIndex, workers: number, readonly cacheBytes: number, worker: WorkerFactory) {
+  private readonly refreshSet?: () => Promise<SetIndex>;
+  private refreshing: Promise<boolean> | null = null;
+  private readonly read: ReadTuning["read"];
+  private readonly merge: boolean;
+
+  private constructor(readonly base: string, public set: SetIndex, workers: number, readonly cacheBytes: number, worker: WorkerFactory,
+    opts: SourceOptions = {}) {
+    this.read = opts.read ?? {};
+    this.merge = opts.merge ?? true;
+    this.refreshSet = opts.refresh;
     this.lods = setLods(set);
     // scalar columns by name; the vector column (an embedding), if any, apart
     this.columns = set.columns.filter((c) => c.dim == null).map((c) => c.name);
@@ -261,25 +357,90 @@ export class PyramidSource {
       this.meta = {};
     }
     this.pca = this.meta.colour === "pca";
-    this.shards = set.shards.map((entry) => ({ entry, url: new URL(entry.path, base).href }));
-    for (const s of this.shards) this.byPath.set(s.entry.path, s);
+    // shards listed as empty have no file
+    this.shards = set.shards
+      .filter((e) => e.path != null || e.url != null)
+      .map((entry) => ({ entry, key: shardKey(entry), url: entry.url ?? new URL(entry.path!, base).href }));
+    for (const s of this.shards) this.byPath.set(s.key, s);
     this.pool = new Pool(workers, worker);
   }
 
   /**
-   * Open the set at `base` (a URL ending in `/`, holding set.json).
-   * `workers`: decode workers (default: CPUs less two, 2 to 4);
-   * `cacheBytes`: decoded tiles kept, least recently used dropped first
-   * (default 512 MB); `worker`: how to make a worker (default the bundled one).
+   * Open the set at `base`: a directory URL (ending in `/`) holding
+   * `set.json` or `set.parquet`, or the URL of either file.
    */
-  static async open(base: string, opts: { workers?: number; cacheBytes?: number; worker?: WorkerFactory } = {}): Promise<PyramidSource> {
+  static async open(base: string, opts: SourceOptions = {}): Promise<PyramidSource> {
     // relative to the page, where there is one
-    const url = new URL(base.endsWith("/") ? base : base + "/", globalThis.location?.href).href;
-    const res = await fetch(new URL("set.json", url));
-    if (!res.ok) throw new Error(`${url}set.json: HTTP ${res.status}`);
-    const set = checkSet(await res.json());
-    const workers = opts.workers ?? Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 2));
-    return new PyramidSource(url, set, workers, opts.cacheBytes ?? 512 * 1024 * 1024, opts.worker ?? defaultWorker);
+    const page = globalThis.location?.href;
+    const file = /\.(json|parquet)$/.test(new URL(base, page).pathname);
+    const dir = new URL(file ? "." : base.endsWith("/") ? base : base + "/", new URL(base, page)).href;
+    let set: SetIndex;
+    if (file && base.endsWith(".parquet")) set = await readSetTable(new URL(base, page).href, opts.compressors);
+    else {
+      const json = file ? new URL(base, page).href : new URL("set.json", dir).href;
+      const res = await fetch(json);
+      // a directory without set.json has set.parquet: a store answers 403 or
+      // 404, a development server its page
+      let parsed: SetIndex | null = null;
+      if (res.ok) {
+        const text = await res.text();
+        try {
+          parsed = JSON.parse(text);
+        } catch (e) {
+          if (file) throw new Error(`${json}: ${e}`);
+        }
+      } else if (file || (res.status !== 404 && res.status !== 403)) throw new Error(`${json}: HTTP ${res.status}`);
+      set = parsed ?? (await readSetTable(new URL("set.parquet", dir).href, opts.compressors));
+    }
+    return PyramidSource.fromSet(set, { ...opts, base: dir });
+  }
+
+  /**
+   * A source over a set given whole, as a service hands one out: its fields
+   * and its shards, each with a `url` (such as a signed URL) or a `path`
+   * relative to `base`.
+   */
+  static fromSet(set: SetIndex, opts: SourceOptions & { base?: string } = {}): PyramidSource {
+    const workers = opts.workers ?? Math.max(2, Math.min(4, (globalThis.navigator?.hardwareConcurrency || 4) - 2));
+    const base = new URL(opts.base ?? ".", globalThis.location?.href ?? "http://localhost/").href;
+    return new PyramidSource(base, checkSet(set), workers, opts.cacheBytes ?? 512 * 1024 * 1024, opts.worker ?? defaultWorker, opts);
+  }
+
+  /**
+   * Fetch the set again (with `refresh`) and take its URLs: a shard whose
+   * file changed (another build) is reopened and its tiles dropped. Once at a
+   * time; resolves false without `refresh`.
+   */
+  private renew(): Promise<boolean> {
+    if (!this.refreshSet) return Promise.resolve(false);
+    this.refreshing ??= this.refreshSet()
+      .then((fresh) => {
+        const set = checkSet(fresh);
+        const known = new Map(this.shards.map((s) => [`${s.entry.tier}/${s.entry.cell}`, s]));
+        for (const e of set.shards) {
+          const s = known.get(`${e.tier}/${e.cell}`);
+          if (!s || (e.path == null && e.url == null)) continue;
+          const url = e.url ?? new URL(e.path!, this.base).href;
+          const same = e.path === s.entry.path && e.bytes === s.entry.bytes && e.footer_bytes === s.entry.footer_bytes;
+          s.url = url;
+          if (!same) {
+            s.entry = e;
+            s.index = s.footer = s.tileRows = s.tileBytes = s.tileGroup = s.opening = undefined;
+            s.failed = undefined;
+            for (const k of [...this.cache.keys()]) if (k.startsWith(s.key + "#")) this.forget(k);
+          } else s.failed = undefined;
+        }
+        this.set = set;
+        this.version++;
+        this.onChange?.();
+        return true;
+      })
+      .catch((e) => {
+        console.error(`[deck.gl-a5pyramid] refreshing the set: ${e}`);
+        return false;
+      })
+      .finally(() => (this.refreshing = null));
+    return this.refreshing;
   }
 
   get workers() {
@@ -304,7 +465,7 @@ export class PyramidSource {
 
   /** Shards of `tier` meeting `box`, open or not. */
   shardsIn(tier: number, box: Box): ShardState[] {
-    return this.shards.filter((s) => s.entry.tier === tier && boxesMeet(s.entry.bbox, box));
+    return this.shards.filter((s) => s.entry.tier === tier && s.entry.bbox != null && boxesMeet(s.entry.bbox, box));
   }
 
   /** Start opening the shards of `tier` meeting `box`; resolves when all have. */
@@ -317,7 +478,12 @@ export class PyramidSource {
     return this.shardsIn(tier, box).every((s) => s.index || s.failed);
   }
 
-  private openShard(s: ShardState): Promise<void> {
+  /** Whether `lod` can be selected for `box`: its shards there have opened. */
+  ready(lod: number, box: Box): boolean {
+    return this.opened(this.tierOf(lod), box);
+  }
+
+  private openShard(s: ShardState, retry = true): Promise<void> {
     if (s.index || s.failed) return Promise.resolve();
     if (s.opening) return s.opening;
     const { bytes, footer_bytes } = s.entry;
@@ -325,6 +491,12 @@ export class PyramidSource {
       this.footersOpening++;
       try {
         const res = await fetch(s.url, { headers: { Range: `bytes=${bytes - footer_bytes}-${bytes - 1}` } });
+        // an expired or superseded file: the set once more, then this shard again
+        if ((res.status === 403 || res.status === 404 || res.status === 410) && retry && (await this.renew())) {
+          s.opening = undefined;
+          await this.openShard(s, false);
+          return;
+        }
         if (res.status !== 206 && res.status !== 200) throw new Error(`HTTP ${res.status}`);
         let footer = await res.arrayBuffer();
         if (res.status === 200 && footer.byteLength === bytes) footer = footer.slice(bytes - footer_bytes);
@@ -335,15 +507,19 @@ export class PyramidSource {
           s.url,
           true, // a shard's index decides which tiles exist: before any tile
         ).promise;
-        s.index = checkIndex(JSON.parse(out.kv.a5pyramid), out.kv.a5_index, s.entry.path);
+        const index = checkIndex(JSON.parse(out.kv.a5pyramid), out.kv.a5_index, s.key);
+        const n = index.tile_bbox.length / 4;
+        if (out.tileRows.length !== n) throw new Error(`the index has ${n} tiles, the footer ${out.tileRows.length}`);
         s.tileRows = out.tileRows;
         s.tileBytes = out.tileBytes;
+        s.tileGroup = out.tileGroup;
+        s.index = index;
         this.stats.shardsOpen++;
         this.version++;
         this.onChange?.();
       } catch (e) {
         s.failed = String((e as Error)?.message ?? e);
-        console.error(`[deck.gl-a5pyramid] ${s.entry.path}: ${s.failed}`);
+        console.error(`[deck.gl-a5pyramid] ${s.key}: ${s.failed}`);
       } finally {
         this.footersOpening--;
       }
@@ -362,7 +538,7 @@ export class PyramidSource {
       if (!level) continue;
       for (let i = level.tiles[0]; i < level.tiles[1]; i++) {
         const b = tileBox(idx, i);
-        if (boxesMeet(b, box)) out.push({ key: `${s.entry.path}#${i}`, shard: s, tile: i, box: b });
+        if (boxesMeet(b, box)) out.push({ key: `${s.key}#${i}`, shard: s, tile: i, box: b });
       }
     }
     return out;
@@ -374,14 +550,30 @@ export class PyramidSource {
    * not. Opens every shard of that tier (a few small footers).
    */
   async baseLevel(budget: { cells: number; bytes: number }): Promise<number | null> {
-    await this.ensure(0, WORLD);
-    const tier = this.set.tiers[0];
-    if (!tier) return null;
-    for (let lod = tier.lods[1]; lod >= tier.lods[0]; lod--) {
-      const c = this.costIn(lod, WORLD);
-      if (c && c.rows > 0 && c.rows <= budget.cells && c.bytes <= budget.bytes) return lod;
+    const fits = (rows: number, bytes: number) => rows > 0 && rows <= budget.cells && bytes <= budget.bytes;
+    // a tier of one level costs what its shards hold, from the set alone
+    const whole = (t: number) => {
+      let rows = 0, bytes = 0;
+      for (const s of this.shards) if (s.entry.tier === t) (rows += s.entry.rows), (bytes += s.entry.bytes);
+      return fits(rows, bytes);
+    };
+    const tiers = this.set.tiers;
+    if (!tiers.length) return null;
+    let best: number | null = null;
+    if (tiers[0].lods[0] === tiers[0].lods[1]) {
+      if (!whole(0)) return null;
+      best = tiers[0].lods[0];
+    } else {
+      await this.ensure(0, WORLD);
+      for (let lod = tiers[0].lods[1]; lod >= tiers[0].lods[0] && best == null; lod--) {
+        const c = this.costIn(lod, WORLD);
+        if (c && fits(c.rows, c.bytes)) best = lod;
+      }
+      if (best !== tiers[0].lods[1]) return best;
     }
-    return null;
+    // finer tiers of one level each (a store's), while they fit
+    for (let t = 1; t < tiers.length && tiers[t].lods[0] === tiers[t].lods[1] && whole(t); t++) best = tiers[t].lods[0];
+    return best;
   }
 
   /**
@@ -408,9 +600,9 @@ export class PyramidSource {
   private costs = new Map<string, { rows: number; bytes: number; tiles: number }>();
 
   tileBox(key: string): Box | null {
-    const [path, i] = key.split("#");
-    const s = this.byPath.get(path);
-    return s?.index ? tileBox(s.index, Number(i)) : null;
+    const k = key.lastIndexOf("#");
+    const s = this.byPath.get(key.slice(0, k));
+    return s?.index ? tileBox(s.index, Number(key.slice(k + 1))) : null;
   }
 
   /**
@@ -432,23 +624,22 @@ export class PyramidSource {
       }
       return hit;
     }
-    const [path, i] = key.split("#");
-    const s = this.byPath.get(path);
-    if (!s?.index || !s.footer) return Promise.reject(new Error(`shard not open: ${path}`));
-    const footer = s.footer;
-    const { job, promise } = this.pool.submit(
-      (id, needsFooter) => ({
-        id, type: "decode", url: s.url, bytes: s.entry.bytes, footer: needsFooter ? footer.slice(0) : undefined,
-        tile: Number(i), lod, columns: this.columns, stats: this.pca, vector: this.vector,
-      }),
-      s.url,
-      urgent,
-    );
+    const k = key.lastIndexOf("#");
+    const i = Number(key.slice(k + 1));
+    const s = this.byPath.get(key.slice(0, k));
+    if (!s?.index || !s.footer) return Promise.reject(new Error(`shard not open: ${key.slice(0, k)}`));
+    const { job, promise: first } = this.submitTile(s, i, lod, urgent);
+    // a read refused for an expired or superseded file: the set once more
+    const promise = first.catch(async (e) => {
+      if (!gone(e) || !(await this.renew()) || !s.index || !s.footer) throw e;
+      return this.submitTile(s, i, lod, urgent).promise;
+    });
     const p = promise.then((out) => {
       const t = out.tile as PackedTile;
       this.stats.tilesDecoded++;
       this.stats.tileBytes += t.fetched;
       this.stats.readMs += t.readMs;
+      this.stats.decodeMs += t.decodeMs ?? 0;
       this.stats.packMs += t.packMs;
       this.stats.statsMs += t.statsMs;
       if (this.jobs.get(key) === job) this.jobs.delete(key);
@@ -465,6 +656,25 @@ export class PyramidSource {
     this.jobs.set(key, job);
     this.watch(key, job, signal);
     return p;
+  }
+
+  /** Queue the read of tile `i` of `s`; tiles of one row group can share a request. */
+  private submitTile(s: ShardState, i: number, lod: number, urgent: boolean) {
+    const footer = s.footer!;
+    const read: ReadOptions = { ...this.read };
+    const group = s.tileGroup?.[i] ?? -1;
+    const url = s.url;
+    const request = (id: number, needsFooter: boolean, tiles: number[]): WorkerRequest => ({
+      id, type: "decode", url, bytes: s.entry.bytes, footer: needsFooter ? footer.slice(0) : undefined,
+      tile: tiles[0], tiles: tiles.length > 1 ? tiles : undefined, lod, columns: this.columns, stats: this.pca, vector: this.vector, read,
+    });
+    return this.pool.submit(
+      (id, needsFooter) => request(id, needsFooter, [i]),
+      url,
+      urgent,
+      group >= 0 ? `${url}#${group}` : undefined,
+      group >= 0 && this.merge ? { n: i, merge: request } : undefined,
+    );
   }
 
   private watch(key: string, job: Job, signal?: AbortSignal) {

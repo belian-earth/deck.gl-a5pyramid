@@ -52,8 +52,8 @@ export function readSet(name: string): SetIndex {
 }
 
 /** A shard's footer, as the source fetches it. */
-export function footerOf(name: string, shard: { path: string; bytes: number; footer_bytes: number }): ArrayBuffer {
-  const b = readFileSync(DIR + name + "/" + shard.path);
+export function footerOf(name: string, shard: { path: string | null; bytes: number; footer_bytes: number }): ArrayBuffer {
+  const b = readFileSync(DIR + name + "/" + shard.path!);
   return new Uint8Array(b.subarray(shard.bytes - shard.footer_bytes)).buffer;
 }
 
