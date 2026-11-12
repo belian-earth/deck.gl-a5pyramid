@@ -107,6 +107,10 @@ const deck = new Deck({ initialViewState: { longitude: 117.8, latitude: 4.96, zo
 - `PyramidSource.open(url, { workers, cacheBytes, worker })`: a set, from the
   URL of its directory (holding `set.json`). `source.close()` stops its
   workers.
+- `PyramidSource.fromSet(set, { refresh, pca, ... })`: a set given whole,
+  its shards with `url`s (signed by a service, say); `refresh` fetches it
+  again when a read is refused (403, 404, 410). `pca: true` reads the PCA
+  sums `ScreenPca` needs for a set whose metadata does not ask for them.
 - `A5PyramidLayer` props: `source`, `colouring`, `cellPx` (default 1),
   `budget` (`{ bytes, cells }`, default `DEFAULT_BUDGET`, 40 MB and 1.5 M
   cells), `onStats(stats)` (the levels drawn, their tiles, the view's cost),

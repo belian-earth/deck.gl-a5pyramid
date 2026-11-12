@@ -131,6 +131,9 @@ Updated 2026-11-12. Design: `docs/design.md`.
    (`parquetHeader` from `src/column.js`, exported from 1.33.0 only), so
    `^1.31.2` let an app keep a hyparquet without it (the ramet47 app's
    1.31.2 failed to import the renderer), and a later minor may move them.
+   And a source option `pca`: tiles carry PCA sums when an app asks,
+   whatever the set's metadata says. Store v4's sets carry no `colour`
+   hint, so the ramet47 app drew grey until it passed `pca: true`.
 1. a5view could load this package instead of its own copy of the lazy
    renderer, one renderer for both.
 2. Propose to deck.gl: abort loading tiles that left the view whatever the

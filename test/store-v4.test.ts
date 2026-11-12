@@ -80,6 +80,19 @@ describe("a store's set", () => {
 });
 
 describe("a set given whole, as a service signs it", () => {
+  it("reads PCA sums when asked, whatever the set's metadata says", async () => {
+    const table = await readSetTable(`${SET}set.parquet`);
+    const plain = { ...table, metadata: {} };
+    for (const pca of [undefined, true]) {
+      const s = PyramidSource.fromSet(plain, { worker: localWorker, workers: 2, base: SET, ...(pca ? { pca } : {}) });
+      expect(s.pca).toBe(!!pca);
+      const { tiles } = await readLevel(s, 18);
+      expect(tiles.every((t) => (t.stats != null) === !!pca)).toBe(true);
+      s.close();
+    }
+  });
+
+
   it("reads files by their URLs and refreshes them once they expire", async () => {
     const table = await readSetTable(`${SET}set.parquet`);
     let signs = 0;
