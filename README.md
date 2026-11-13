@@ -111,11 +111,18 @@ const deck = new Deck({ initialViewState: { longitude: 117.8, latitude: 4.96, zo
   its shards with `url`s (signed by a service, say); `refresh` fetches it
   again when a read is refused (403, 404, 410). `pca: true` reads the PCA
   sums `ScreenPca` needs for a set whose metadata does not ask for them.
+- `region` (either constructor): draw only the cells of a region, given as
+  polygons' outer rings (`[[lon, lat], ...]` each, holes filled, not
+  crossing the antimeridian). See "A region" below.
+- `merge`: tiles of one row group that a view asks for together are read
+  with one request a column. Off by default for http(s) URLs, where it cut
+  the requests in flight and slowed reads over a CDN; on for local files.
 - `A5PyramidLayer` props: `source`, `colouring`, `cellPx` (default 1),
   `budget` (`{ bytes, cells }`, default `DEFAULT_BUDGET`, 40 MB and 1.5 M
   cells), `onStats(stats)` (the levels drawn, their tiles, the view's cost),
   and deck.gl's `pickable`, `opacity` and `extensions` (with their props:
-  a `MaskExtension` and `maskId` draw the cells only inside a mask layer).
+  a `MaskExtension` and `maskId` clip the cells to a mask layer; a source's
+  `region` draws whole cells instead).
   Picking gives a `CellInfo`: the
   cell id, its LOD, `ncell` and its codes.
 - Colourings: `bandColouring(stretch)`, `neutralColouring()`,
@@ -124,6 +131,28 @@ const deck = new Deck({ initialViewState: { longitude: 117.8, latitude: 4.96, zo
 - `ScreenPca`, `pcaBasis`, `scores`: screen PCA.
 - `a5Resolution`, `cellPixels`, `chooseLevel` and friends: the level rules,
   for overlays and tests.
+
+### A region
+
+```ts
+const source = PyramidSource.fromSet(set, { region: rings, pca: true });
+```
+
+Each level's cells are those of a5-js `polygonToCells(ring, level, {
+containment: "overlapping" })`, each ring's covering unioned: every cell
+that touches a ring is drawn, whole, and no other. The coverings are built
+in the decode workers when a level is first read there (on a region of 19
+rings: 3 to 32 ms a level up to 14, 62 ms at 15, about 0.5 s at 18) and
+kept; a tile's rows outside them are dropped before packing and before
+the PCA sums, so screen PCA describes the region alone.
+
+What cannot hold a cell of the region is not read: a shard whose box meets
+no ring's box (not even its footer), and a tile whose cell id bounds miss
+its level's covering. The bounds come from the footer already fetched: the
+cell column's statistics where a tile is a row group, the column index
+where a tile is a page of a larger row group; a file with neither falls
+back to the tile's box against the rings' boxes. `source.stats.tilesSkipped`
+and `rowsDropped` count them.
 
 ## Data
 

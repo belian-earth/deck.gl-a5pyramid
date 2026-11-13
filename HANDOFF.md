@@ -1,6 +1,6 @@
 # Handoff: deck.gl-a5pyramid
 
-Updated 2026-11-12. Design: `docs/design.md`.
+Updated 2026-11-13. Design: `docs/design.md`.
 
 ## State
 
@@ -11,11 +11,42 @@ Updated 2026-11-12. Design: `docs/design.md`.
   demo installs `github:belian-earth/deck.gl-a5pyramid#v0.1.0`.
   GitHub only for now; npm once the API settles (Hugh, 2026-11-10). Licence
   Apache 2.0, as a5pyramid.
-- `npm run check`, `npm test` (41 unit tests in Node against fixture sets
+- `npm run check`, `npm test` (52 unit tests in Node against fixture sets
   written by a5pyramid) and `npm run test:browser` (GPU colours read
   back in headless Chrome: 134 cells a set, within 1/255 of the formula)
   pass. CI runs all three and the build; the first run on GitHub passed
   with the same browser figures (134 cells a set, worst 1 and 0).
+- Branch `region-filter` (2026-11-13, 0.3.0, for ramet47-app's embeddings
+  layer, whose MaskExtension clipped cells at the donor region's edge):
+  - **`region`** on `PyramidSource.open`/`fromSet`: polygons as outer
+    rings. Each level's covering is a5-js `polygonToCells` (overlapping) of
+    each ring, built in a worker when a level is first read there and kept
+    per ring (`src/region.ts`). The rings go to each worker with its first
+    request; requests name the region by the source's id. Rows outside the
+    covering are dropped before packing and the PCA sums (one merge pass
+    over the covering's id ranges: a stored cell `c` with tag `t` holds the
+    level's ids strictly between `c - t` and `c + t`; cells coarser than
+    resolution 2 are split first). Tested against a5-js `contains`.
+  - **Skipping:** a shard whose box meets no ring's box is never opened;
+    a worker's index marks the tiles that cannot meet the region: tile box
+    against the ring boxes, then the tile's cell id bounds (row-group
+    statistics for a tile that is its row group, the column index in the
+    fetched footer for a page) against the rings' coverings of its level.
+    `stats.tilesSkipped`, `stats.rowsDropped`. On the fixtures with a
+    triangle whose box holds every tile, bounds skip 5 of 20 leaf tiles
+    (`vector`) and 22 of 70 (`store-v4`).
+  - **`merge`** defaults off for http(s) URLs (on for other URLs). Over the
+    CDN (2026-11-13, the Pará tour in Node) merged reads took 16.8 to 17.4 s
+    against 10.6 to 12.6 s without, with several connections; equal over one
+    HTTP/2 connection.
+  - Pará 2022 (belianapi's signed set, the donor region's 19 outer rings),
+    Node over CloudFront, in-process workers:
+    - tour A (8 views, warm): without the region 173 tiles, 134.4 MB,
+      11.3 then 9.8 s; with it 77 tiles, 55.9 MB, 5.4 then 4.6 s.
+    - tour C (7 new views, cold first pass): without 120 tiles, 101.0 MB,
+      34.6 s cold, 9.0 s warm; with 9 tiles, 8.3 MB, 2.1 s cold, 1.4 s warm.
+  - Not run here: `npm run test:browser` (no Playwright browsers on this
+    machine); CI runs it.
 - Branch `flat-list-vectors` (2026-11-12): a vector stored as a
   fixed-length list (LIST<INT8>, store schema v4, belian-production
   `docs/store-v4.md`) is read by `src/fixed-list.ts`, not `parquetRead`.

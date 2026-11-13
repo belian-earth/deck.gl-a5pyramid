@@ -5,12 +5,14 @@
 
 import { parquetMetadata, parquetRead, type Compressors, type FileMetaData } from "hyparquet";
 import { cellToBoundary } from "a5-js";
-import { readOffsetIndex } from "hyparquet/src/indexes.js";
+import { readColumnIndex, readOffsetIndex } from "hyparquet/src/indexes.js";
 import { readColumn } from "hyparquet/src/column.js";
 import { getTreePath } from "hyparquet/src/schema.js";
 import { DEFAULT_PARSERS } from "hyparquet/src/convert.js";
 import { parquetSchema, type ColumnMetaData } from "hyparquet";
 import { chunkRange, listColumn, readFixedList, type ListColumn } from "./fixed-list.js";
+import { boxesMeet, type Box } from "./format.js";
+import { markRows, rangesMeet, ringBox, ringRanges, type Ring } from "./region.js";
 
 /** A tile ready for deck.gl: binary polygon attributes plus what hover needs. */
 export interface PackedTile {
@@ -53,6 +55,8 @@ export interface PackedTile {
   /** The tile's sums for a PCA of its decoded values (when asked for). */
   stats: TileStats | null;
   statsMs: number;
+  /** Rows read and dropped as outside the source's region (0 without one). */
+  dropped: number;
 }
 
 /**
@@ -151,6 +155,11 @@ interface Shard {
   hasNcell?: boolean;
   /** The schema tree, for decoding pages apart from parquetRead. */
   tree?: ReturnType<typeof parquetSchema>;
+  /** The file's a5pyramid index (tile boxes and levels), when it has one. */
+  index: { tile_bbox: number[]; levels: { lod: number; tiles: [number, number] }[] } | null;
+  /** Each tile's least and greatest cell id from the footer's statistics,
+   * null where they are not there; worked out once. */
+  cellRange?: ([bigint, bigint] | null)[];
 }
 
 /** Decompressors beyond hyparquet's own (snappy): store schema v4 files are
@@ -218,8 +227,128 @@ export function openShard(url: string, byteLength: number, footer: ArrayBuffer):
   shards.set(url, {
     metadata, rowStarts, tiles, footer, footerStart: byteLength - footer.byteLength,
     file: new RemoteFile(url, byteLength), lists: new Map(),
+    index: index && Array.isArray(index.tile_bbox) && Array.isArray(index.levels) ? index : null,
   });
   return metadata;
+}
+
+// ---- the region ---------------------------------------------------------
+
+/** A region as a worker holds it: its rings, their boxes, and each ring's
+ * covering of each level as id ranges, built when first wanted. */
+interface RegionState {
+  rings: Ring[];
+  boxes: Box[];
+  ranges: Map<string, BigUint64Array>;
+}
+/** Regions by id (the source's): sent once to each worker. */
+const regions = new Map<number, RegionState>();
+
+export function setRegion(id: number, rings: Ring[]): void {
+  regions.set(id, { rings, boxes: rings.map(ringBox), ranges: new Map() });
+}
+
+/** Ring `i`'s covering of `lod` as id ranges. */
+function rangesAt(r: RegionState, i: number, lod: number): BigUint64Array {
+  const key = `${lod}|${i}`;
+  let out = r.ranges.get(key);
+  if (!out) r.ranges.set(key, (out = ringRanges(r.rings[i], lod)));
+  return out;
+}
+
+function tileBoxOf(s: Shard, tile: number): Box | null {
+  const b = s.index?.tile_bbox;
+  return b && b.length >= 4 * (tile + 1) ? [b[4 * tile], b[4 * tile + 1], b[4 * tile + 2], b[4 * tile + 3]] : null;
+}
+
+function tileLod(s: Shard, tile: number): number | null {
+  const l = s.index?.levels.find((v) => tile >= v.tiles[0] && tile < v.tiles[1]);
+  return l ? l.lod : null;
+}
+
+/** The rings whose boxes meet the tile's box (every ring without a box). */
+function ringsAt(r: RegionState, box: Box | null): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < r.rings.length; i++) if (!box || boxesMeet(r.boxes[i], box)) out.push(i);
+  return out;
+}
+
+const asU64 = (v: unknown): bigint | null => (typeof v === "bigint" ? BigInt.asUintN(64, v) : typeof v === "number" && Number.isSafeInteger(v) ? BigInt(v) : null);
+
+/** Each tile's least and greatest cell id from the footer as fetched: the
+ * cell column's statistics where a tile is its row group, its column index
+ * (each page's bounds) where a tile is a page; null where neither is there. */
+function cellRanges(s: Shard): ([bigint, bigint] | null)[] {
+  if (s.cellRange) return s.cellRange;
+  const schema = s.metadata.schema.find((e) => e.name === "cell");
+  const pageBounds = new Map<number, { min: unknown[]; max: unknown[] } | null>();
+  const bounds = (g: number) => {
+    if (!pageBounds.has(g)) {
+      let out: { min: unknown[]; max: unknown[] } | null = null;
+      const c = s.metadata.row_groups[g].columns.find((x) => x.meta_data?.path_in_schema[0] === "cell");
+      const at = c?.column_index_offset != null ? Number(c.column_index_offset) - s.footerStart : -1;
+      if (c && schema && at >= 0 && at + Number(c.column_index_length) <= s.footer.byteLength) {
+        try {
+          const ci = readColumnIndex({ view: new DataView(s.footer, at, Number(c.column_index_length)), offset: 0 }, schema);
+          out = { min: ci.min_values, max: ci.max_values };
+        } catch {
+          out = null;
+        }
+      }
+      pageBounds.set(g, out);
+    }
+    return pageBounds.get(g)!;
+  };
+  s.cellRange = s.tiles.map((t) => {
+    let lo: bigint | null = null, hi: bigint | null = null;
+    if (t.shared) {
+      const b = bounds(t.rowGroup);
+      if (b) (lo = asU64(b.min[t.page])), (hi = asU64(b.max[t.page]));
+    } else {
+      const st = s.metadata.row_groups[t.rowGroup].columns.find((x) => x.meta_data?.path_in_schema[0] === "cell")?.meta_data?.statistics;
+      if (st) (lo = asU64(st.min_value)), (hi = asU64(st.max_value));
+    }
+    return lo != null && hi != null && lo <= hi ? [lo, hi] : null;
+  });
+  return s.cellRange;
+}
+
+/**
+ * Whether tile `tile` of `s` can hold a cell of the region: its box meets a
+ * ring's box, and where the footer gives its cell bounds, they meet one of
+ * those rings' coverings of its level.
+ */
+function tileMeetsRegion(s: Shard, tile: number, r: RegionState): boolean {
+  const rings = ringsAt(r, tileBoxOf(s, tile));
+  if (!rings.length) return false;
+  const lod = tileLod(s, tile);
+  const b = cellRanges(s)[tile];
+  if (lod == null || !b) return true;
+  return rings.some((i) => rangesMeet(rangesAt(r, i, lod), b[0], b[1]));
+}
+
+/** Rows of a tile at `lod` with the cells outside the region dropped. */
+function inRegion(rows: Rows, s: Shard, tile: number, lod: number, r: RegionState | undefined): { rows: Rows; dropped: number } {
+  if (!r || !rows.n) return { rows, dropped: 0 };
+  const keep = new Uint8Array(rows.n);
+  for (const i of ringsAt(r, tileBoxOf(s, tile))) markRows(rows.cells, rangesAt(r, i, lod), keep);
+  let n = 0;
+  for (let i = 0; i < rows.n; i++) n += keep[i];
+  if (n === rows.n) return { rows, dropped: 0 };
+  const dim = rows.vector ? rows.vector.length / rows.n : 0;
+  const cells = new BigUint64Array(n);
+  const ncell = new Uint32Array(n);
+  const values = rows.values.map(() => new Int8Array(n));
+  const vector = rows.vector ? new Int8Array(n * dim) : null;
+  for (let i = 0, j = 0; i < rows.n; i++) {
+    if (!keep[i]) continue;
+    cells[j] = rows.cells[i];
+    ncell[j] = rows.ncell[i];
+    for (let k = 0; k < values.length; k++) values[k][j] = rows.values[k][i];
+    if (vector) vector.set(rows.vector!.subarray(i * dim, (i + 1) * dim), j * dim);
+    j++;
+  }
+  return { rows: { ...rows, n, cells, ncell, values, vector }, dropped: rows.n - n };
 }
 
 export function hasShard(url: string): boolean {
@@ -504,7 +633,7 @@ async function readTilePages(s: Shard, url: string, locs: TileLoc[], columns: st
 
 /** Pack rows [a, b) of decoded rows into a tile. */
 function packRows(r: Rows, a: number, b: number, lod: number, dimOrNull: number | null, withStats: boolean, statsEvery: number | undefined,
-  timing: { fetched: number; readMs: number; decodeMs: number }): PackedTile {
+  timing: { fetched: number; readMs: number; decodeMs: number }, dropped = 0): PackedTile {
   const n = b - a;
   const cells = r.cells.slice(a, b);
   const ncell = r.ncell.slice(a, b);
@@ -543,7 +672,7 @@ function packRows(r: Rows, a: number, b: number, lod: number, dimOrNull: number 
     codesWidth: layout.width, codesRows: layout.rows, texels: layout.texels, perRow: layout.perRow,
     ...packed, byteLength,
     fetched: timing.fetched, readMs: timing.readMs, decodeMs: timing.decodeMs + (t3 - t2),
-    packMs: performance.now() - t3 - statsMs, stats, statsMs,
+    packMs: performance.now() - t3 - statsMs, stats, statsMs, dropped,
   };
 }
 
@@ -551,7 +680,7 @@ function packRows(r: Rows, a: number, b: number, lod: number, dimOrNull: number 
  * group of several tiles) and pack it. */
 export async function readTile(
   url: string, tile: number, lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
-  opts: ReadOptions = {},
+  opts: ReadOptions = {}, region?: number,
 ): Promise<PackedTile> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
@@ -559,14 +688,17 @@ export async function readTile(
   if (!loc) throw new Error(`${url} has no tile ${tile}`);
   const dim = vector ? vector.dim : null;
   const r = loc.shared ? (await readTilePages(s, url, [loc], columns, vector))[0] : await readRows(s, loc.rowGroup, columns, vector, opts);
-  return packRows(r, 0, r.n, lod, dim, withStats, opts.statsEvery, r);
+  const t = performance.now();
+  const kept = inRegion(r, s, tile, lod, region != null ? regions.get(region) : undefined);
+  const timing = { ...r, decodeMs: r.decodeMs + performance.now() - t };
+  return packRows(kept.rows, 0, kept.rows.n, lod, dim, withStats, opts.statsEvery, timing, kept.dropped);
 }
 
 /** Read several tiles of one row group of an open shard together (one
  * request a column for each run of their pages) and pack them, in order. */
 export async function readTiles(
   url: string, tiles: number[], lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
-  opts: ReadOptions = {},
+  opts: ReadOptions = {}, region?: number,
 ): Promise<PackedTile[]> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
@@ -576,11 +708,17 @@ export async function readTiles(
     return loc;
   });
   if (!locs.every((l) => l.shared && l.rowGroup === locs[0].rowGroup)) {
-    return Promise.all(tiles.map((t) => readTile(url, t, lod, columns, withStats, vector, opts)));
+    return Promise.all(tiles.map((t) => readTile(url, t, lod, columns, withStats, vector, opts, region)));
   }
   const dim = vector ? vector.dim : null;
   const rows = await readTilePages(s, url, locs, columns, vector);
-  return rows.map((r) => packRows(r, 0, r.n, lod, dim, withStats, opts.statsEvery, r));
+  const reg = region != null ? regions.get(region) : undefined;
+  return rows.map((r, k) => {
+    const t = performance.now();
+    const kept = inRegion(r, s, tiles[k], lod, reg);
+    const timing = { ...r, decodeMs: r.decodeMs + performance.now() - t };
+    return packRows(kept.rows, 0, kept.rows.n, lod, dim, withStats, opts.statsEvery, timing, kept.dropped);
+  });
 }
 
 function copyInto<T>(out: { [i: number]: T; length: number }, parts: ArrayLike<unknown>[], conv: (v: unknown) => T) {
@@ -636,7 +774,7 @@ export function transferables(t: PackedTile): ArrayBuffer[] {
 }
 
 /** A message to a decode worker. */
-export type WorkerRequest =
+export type WorkerRequest = (
   | { id: number; type: "index"; url: string; bytes: number; footer: ArrayBuffer }
   | {
       id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number;
@@ -644,7 +782,14 @@ export type WorkerRequest =
       /** Several tiles of one row group, read together: one request a
        * column for their pages. The reply has `tiles` in this order. */
       tiles?: number[];
-    };
+    }
+) & {
+  /** The source's region, by id: tiles are read for it (an index marks the
+   * tiles that cannot meet it; a tile drops its rows outside it). */
+  region?: number;
+  /** The region's rings, sent with a worker's first request. */
+  regionRings?: Ring[];
+};
 
 /**
  * What a worker does with a message: open a shard (its index, and each
@@ -653,25 +798,34 @@ export type WorkerRequest =
  */
 export async function handleRequest(m: WorkerRequest): Promise<{ reply: Record<string, unknown>; transfer: ArrayBuffer[] }> {
   try {
+    if (m.region != null && m.regionRings) setRegion(m.region, m.regionRings);
+    const region = m.region != null ? regions.get(m.region) : undefined;
+    if (m.region != null && !region) throw new Error(`region ${m.region} was never sent`);
     if (m.type === "index") {
       const md = openShard(m.url, m.bytes, m.footer);
-      const tiles = shards.get(m.url)!.tiles;
+      const s = shards.get(m.url)!;
+      const tiles = s.tiles;
       const groupBytes = md.row_groups.map((rg) => rg.columns.reduce((a, c) => a + Number(c.meta_data?.total_compressed_size ?? 0), 0));
       const tileRows = tiles.map((t) => t.rows);
       // a tile of a shared row group: its share of the group's bytes
       const tileBytes = tiles.map((t) => groupBytes[t.rowGroup] * (t.shared ? t.rows / Number(md.row_groups[t.rowGroup].num_rows) : 1));
       const tileGroup = tiles.map((t) => (t.shared ? t.rowGroup : -1));
-      return { reply: { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes, tileGroup }, transfer: [] };
+      // with a region: which tiles can hold one of its cells
+      const tileMeets = region ? Uint8Array.from(tiles, (_, i) => (tileMeetsRegion(s, i, region) ? 1 : 0)) : null;
+      return {
+        reply: { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes, tileGroup, tileMeets },
+        transfer: tileMeets ? [tileMeets.buffer] : [],
+      };
     }
     if (!hasShard(m.url)) {
       if (!m.footer) throw new Error(`no footer for ${m.url}`);
       openShard(m.url, m.bytes, m.footer);
     }
     if (m.tiles && m.tiles.length > 1) {
-      const tiles = await readTiles(m.url, m.tiles, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {});
+      const tiles = await readTiles(m.url, m.tiles, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {}, m.region);
       return { reply: { id: m.id, tiles }, transfer: tiles.flatMap(transferables) };
     }
-    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {});
+    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {}, m.region);
     return { reply: { id: m.id, tile }, transfer: transferables(tile) };
   } catch (e) {
     return { reply: { id: m.id, error: String((e as Error)?.message ?? e) }, transfer: [] };
