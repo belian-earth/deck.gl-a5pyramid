@@ -6,6 +6,7 @@ export {
   PyramidSource, defaultWorker, type WorkerFactory, type SourceStats, type SourceOptions, type ReadTuning,
 } from "./source.js";
 export { readSetTable } from "./set-table.js";
+export { type Ring } from "./region.js";
 export {
   A5PyramidLayer, emptyRenderStats, isSettled,
   type A5PyramidLayerProps, type RenderStats, type CellInfo,

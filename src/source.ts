@@ -18,6 +18,7 @@ import {
 } from "./format.js";
 import type { PackedTile, ReadOptions } from "./tile-core.js";
 import { readSetTable } from "./set-table.js";
+import { checkRings, ringBox, type Ring } from "./region.js";
 import { boxKey } from "./tiling.js";
 import type { Compressors } from "hyparquet";
 
@@ -47,6 +48,9 @@ interface ShardState {
   tileRows?: number[];
   tileBytes?: number[];
   tileGroup?: number[];
+  /** With a region: whether each tile can hold one of its cells (from the
+   * worker that read the footer). */
+  tileMeets?: Uint8Array;
   opening?: Promise<void>;
   failed?: string;
 }
@@ -61,8 +65,11 @@ export interface TileRef {
 /**
  * How tiles are read (the viewer's optimisations of 2026-11-12): one range
  * request a row group read whole, and the PCA sample rate. `merge`: tiles of
- * one row group that a view asks for together share one request a column
- * (default true).
+ * one row group that a view asks for together share one request a column.
+ * Default: off for a set whose files are http(s) URLs, on otherwise (local
+ * files). Over a CDN merging cut the requests in flight and slowed a tour by
+ * about 60% with several connections, and gained nothing over one HTTP/2
+ * connection (2026-11-13); on local files it saves requests at no cost.
  */
 export interface ReadTuning {
   read?: Pick<ReadOptions, "singleRange" | "statsEvery">;
@@ -88,6 +95,18 @@ export interface SourceOptions extends ReadTuning {
   refresh?: () => Promise<SetIndex>;
   compressors?: Compressors;
   pca?: boolean;
+  /**
+   * Draw only the cells of a region: polygons as their outer rings (holes
+   * filled by the caller), `[longitude, latitude]` points, not crossing the
+   * antimeridian. Each level's cells are those of a5-js `polygonToCells`
+   * (containment "overlapping") of each ring, unioned, so a cell is drawn
+   * whole or not at all, and PCA sums are taken over the region's cells
+   * alone. Built in the workers, a level when first read. Shards and tiles
+   * that cannot hold one of its cells are not read: a shard by its box, a
+   * tile by its cell id bounds in the footer (statistics or column index)
+   * against the level's covering, else by its box against the rings'.
+   */
+  region?: Ring[];
 }
 
 /** A shard's name in tile keys. */
@@ -115,6 +134,10 @@ export interface SourceStats {
   cached: number;
   cachedBytes: number;
   inFlight: number;
+  /** Tiles of opened shards that cannot hold a cell of the region, so are never read. */
+  tilesSkipped: number;
+  /** Rows read and dropped as outside the region. */
+  rowsDropped: number;
 }
 
 /** A request for a worker, queued on the main thread until a worker is free. */
@@ -155,7 +178,7 @@ class Pool {
   static PER_WORKER = 2;
   /** The most tiles of one row group read in one request. */
   static MERGE = 8;
-  private workers: { w: Worker; busy: number; shards: Set<string> }[] = [];
+  private workers: { w: Worker; busy: number; shards: Set<string>; region: boolean }[] = [];
   private running = new Map<number, { jobs: Job[]; slot: number }>();
   private pumping = false;
   private queue: Job[] = [];
@@ -166,7 +189,7 @@ class Pool {
   private seq = 0;
   private next = 1;
 
-  constructor(size: number, make: WorkerFactory) {
+  constructor(size: number, make: WorkerFactory, private readonly region: { id: number; rings: Ring[] } | null = null) {
     for (let i = 0; i < size; i++) {
       const w = make();
       const slot = i;
@@ -181,7 +204,7 @@ class Pool {
         else r.jobs[0].resolve(ev.data);
         this.pump();
       };
-      this.workers.push({ w, busy: 0, shards: new Set() });
+      this.workers.push({ w, busy: 0, shards: new Set(), region: false });
     }
   }
 
@@ -297,7 +320,13 @@ class Pool {
       w.shards.add(job.shard);
       w.busy++;
       this.running.set(id, { jobs, slot });
-      w.w.postMessage(jobs.length > 1 ? job.tile!.merge(id, needsFooter, jobs.map((j) => j.tile!.n)) : job.build(id, needsFooter));
+      const msg = jobs.length > 1 ? job.tile!.merge(id, needsFooter, jobs.map((j) => j.tile!.n)) : job.build(id, needsFooter);
+      // the region, by id; its rings with a worker's first request
+      if (this.region) {
+        msg.region = this.region.id;
+        if (!w.region) (msg.regionRings = this.region.rings), (w.region = true);
+      }
+      w.w.postMessage(msg);
     }
   }
 
@@ -325,12 +354,17 @@ export class PyramidSource {
   onChange: (() => void) | null = null;
   readonly stats: SourceStats = {
     cancelled: 0, shardsOpen: 0, footerBytes: 0, tileBytes: 0, tilesDecoded: 0, readMs: 0, decodeMs: 0, packMs: 0,
-    statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0,
+    statsMs: 0, cached: 0, cachedBytes: 0, inFlight: 0, tilesSkipped: 0, rowsDropped: 0,
   };
   /** The set's metadata from its writer (the `a5pyramids` entry), parsed. */
   readonly meta: Record<string, any>;
   /** Whether tiles come with PCA sums: the `pca` option, else the set's colour is "pca". */
   readonly pca: boolean;
+  /** The region's rings (the `region` option), or null. */
+  readonly region: Ring[] | null;
+  /** Whether tiles of one row group share a request (the `merge` option or its default). */
+  readonly merge: boolean;
+  private readonly regionBoxes: Box[] | null;
 
   private shards: ShardState[];
   private byPath = new Map<string, ShardState>();
@@ -342,12 +376,10 @@ export class PyramidSource {
   private readonly refreshSet?: () => Promise<SetIndex>;
   private refreshing: Promise<boolean> | null = null;
   private readonly read: ReadTuning["read"];
-  private readonly merge: boolean;
 
   private constructor(readonly base: string, public set: SetIndex, workers: number, readonly cacheBytes: number, worker: WorkerFactory,
     opts: SourceOptions = {}) {
     this.read = opts.read ?? {};
-    this.merge = opts.merge ?? true;
     this.refreshSet = opts.refresh;
     this.lods = setLods(set);
     // scalar columns by name; the vector column (an embedding), if any, apart
@@ -365,7 +397,10 @@ export class PyramidSource {
       .filter((e) => e.path != null || e.url != null)
       .map((entry) => ({ entry, key: shardKey(entry), url: entry.url ?? new URL(entry.path!, base).href }));
     for (const s of this.shards) this.byPath.set(s.key, s);
-    this.pool = new Pool(workers, worker);
+    this.merge = opts.merge ?? !this.shards.some((s) => /^https?:/i.test(s.url));
+    this.region = opts.region ? checkRings(opts.region) : null;
+    this.regionBoxes = this.region ? this.region.map(ringBox) : null;
+    this.pool = new Pool(workers, worker, this.region ? { id: this.id, rings: this.region } : null);
   }
 
   /**
@@ -428,7 +463,7 @@ export class PyramidSource {
           s.url = url;
           if (!same) {
             s.entry = e;
-            s.index = s.footer = s.tileRows = s.tileBytes = s.tileGroup = s.opening = undefined;
+            s.index = s.footer = s.tileRows = s.tileBytes = s.tileGroup = s.tileMeets = s.opening = undefined;
             s.failed = undefined;
             for (const k of [...this.cache.keys()]) if (k.startsWith(s.key + "#")) this.forget(k);
           } else s.failed = undefined;
@@ -466,9 +501,14 @@ export class PyramidSource {
     return tierOf(this.set, lod);
   }
 
-  /** Shards of `tier` meeting `box`, open or not. */
+  /** Shards of `tier` meeting `box` (and the region's rings' boxes), open or not. */
   shardsIn(tier: number, box: Box): ShardState[] {
-    return this.shards.filter((s) => s.entry.tier === tier && s.entry.bbox != null && boxesMeet(s.entry.bbox, box));
+    return this.shards.filter((s) => s.entry.tier === tier && s.entry.bbox != null && boxesMeet(s.entry.bbox, box) && this.inRegion(s.entry.bbox));
+  }
+
+  /** Whether a box meets the region's (every box, without one). */
+  private inRegion(box: Box): boolean {
+    return !this.regionBoxes || this.regionBoxes.some((b) => boxesMeet(b, box));
   }
 
   /** Start opening the shards of `tier` meeting `box`; resolves when all have. */
@@ -516,6 +556,10 @@ export class PyramidSource {
         s.tileRows = out.tileRows;
         s.tileBytes = out.tileBytes;
         s.tileGroup = out.tileGroup;
+        if (out.tileMeets) {
+          s.tileMeets = out.tileMeets as Uint8Array;
+          for (const m of s.tileMeets) if (!m) this.stats.tilesSkipped++;
+        }
         s.index = index;
         this.stats.shardsOpen++;
         this.version++;
@@ -540,6 +584,7 @@ export class PyramidSource {
       const level = idx.levels.find((l) => l.lod === lod);
       if (!level) continue;
       for (let i = level.tiles[0]; i < level.tiles[1]; i++) {
+        if (s.tileMeets && !s.tileMeets[i]) continue;
         const b = tileBox(idx, i);
         if (boxesMeet(b, box)) out.push({ key: `${s.key}#${i}`, shard: s, tile: i, box: b });
       }
@@ -557,7 +602,7 @@ export class PyramidSource {
     // a tier of one level costs what its shards hold, from the set alone
     const whole = (t: number) => {
       let rows = 0, bytes = 0;
-      for (const s of this.shards) if (s.entry.tier === t) (rows += s.entry.rows), (bytes += s.entry.bytes);
+      for (const s of this.shards) if (s.entry.tier === t && (s.entry.bbox == null || this.inRegion(s.entry.bbox))) (rows += s.entry.rows), (bytes += s.entry.bytes);
       return fits(rows, bytes);
     };
     const tiers = this.set.tiers;
@@ -645,6 +690,7 @@ export class PyramidSource {
       this.stats.decodeMs += t.decodeMs ?? 0;
       this.stats.packMs += t.packMs;
       this.stats.statsMs += t.statsMs;
+      this.stats.rowsDropped += t.dropped ?? 0;
       if (this.jobs.get(key) === job) this.jobs.delete(key);
       this.remember(key, t.byteLength);
       return t;
