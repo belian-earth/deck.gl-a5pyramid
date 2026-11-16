@@ -1,7 +1,9 @@
 // Reading and packing tiles, in a worker (or under Node in tests): no DOM,
 // no deck.gl. Ported from a5view's tileCore (lazy-renderer.js) for shards of
 // a set: a shard's footer arrives as bytes fetched once by the main thread,
-// and its tiles are read with range requests from the shard's URL.
+// and its tiles are decoded from the byte ranges the main thread fetched
+// for them (`pieces`; the index reply lists each tile's ranges), or, called
+// directly, read with range requests from the shard's URL.
 
 import { parquetMetadata, parquetRead, type Compressors, type FileMetaData } from "hyparquet";
 import { cellToBoundary } from "a5-js";
@@ -169,8 +171,14 @@ export function setCompressors(c: Compressors | undefined): void {
   compressors = c;
 }
 
+/** A file as the readers slice it. */
+interface FileLike {
+  byteLength: number;
+  slice(start: number, end?: number): Promise<ArrayBuffer>;
+}
+
 /** A shard file read by HTTP range requests. */
-class RemoteFile {
+class RemoteFile implements FileLike {
   constructor(readonly url: string, readonly byteLength: number) {}
   async slice(start: number, end?: number): Promise<ArrayBuffer> {
     const last = (end ?? this.byteLength) - 1;
@@ -180,6 +188,25 @@ class RemoteFile {
     // a server that ignores Range sends the whole file
     return res.status === 200 && buf.byteLength === this.byteLength ? buf.slice(start, last + 1) : buf;
   }
+}
+
+/** Bytes `[lo, hi)` of a shard's file, fetched on the main thread. */
+export interface Piece {
+  lo: number;
+  hi: number;
+  buf: ArrayBuffer;
+}
+
+/** A file served from pieces fetched ahead: a slice outside them is an error. */
+function piecesFile(url: string, byteLength: number, pieces: Piece[]): FileLike {
+  return {
+    byteLength,
+    slice: async (start, end) => {
+      const e = end ?? byteLength;
+      for (const p of pieces) if (p.lo <= start && e <= p.hi) return p.buf.slice(start - p.lo, e - p.lo);
+      throw new Error(`${url}: bytes ${start}-${e} were not fetched for the tile`);
+    },
+  };
 }
 
 const shards = new Map<string, Shard>();
@@ -240,12 +267,46 @@ interface RegionState {
   rings: Ring[];
   boxes: Box[];
   ranges: Map<string, BigUint64Array>;
+  /** Coverings the main thread has been given (or gave): not sent again. */
+  reported: Set<string>;
 }
-/** Regions by id (the source's): sent once to each worker. */
+/** Regions by id (a key of their rings, the same across sources and workers): sent once to each worker. */
 const regions = new Map<number, RegionState>();
 
 export function setRegion(id: number, rings: Ring[]): void {
-  regions.set(id, { rings, boxes: rings.map(ringBox), ranges: new Map() });
+  if (regions.has(id)) return;
+  regions.set(id, { rings, boxes: rings.map(ringBox), ranges: new Map(), reported: new Set() });
+}
+
+/** A covering of one level by one ring, as workers and the main thread pass it. */
+export interface Covering {
+  region: number;
+  /** `<lod>|<ring>` */
+  key: string;
+  ranges: BigUint64Array;
+}
+
+/** Coverings computed here and not yet reported to the main thread (copies, to transfer). */
+function freshCoverings(): Covering[] {
+  const out: Covering[] = [];
+  for (const [region, r] of regions) {
+    for (const [key, ranges] of r.ranges) {
+      if (r.reported.has(key)) continue;
+      r.reported.add(key);
+      out.push({ region, key, ranges: ranges.slice() });
+    }
+  }
+  return out;
+}
+
+/** Coverings another worker computed, from the main thread. */
+function takeCoverings(list: Covering[]): void {
+  for (const c of list) {
+    const r = regions.get(c.region);
+    if (!r) continue;
+    if (!r.ranges.has(c.key)) r.ranges.set(c.key, c.ranges);
+    r.reported.add(c.key);
+  }
 }
 
 /** Ring `i`'s covering of `lod` as id ranges. */
@@ -388,30 +449,58 @@ interface Rows {
   decodeMs: number;
 }
 
-function cached<T>(m: Map<string, Promise<T>>, key: string, keep: number, make: () => Promise<T>): Promise<T> {
-  const hit = m.get(key);
-  if (hit) {
-    m.delete(key);
-    m.set(key, hit);
-    return hit;
-  }
-  const p = make();
-  m.set(key, p);
-  p.catch(() => m.delete(key));
-  while (m.size > keep) m.delete(m.keys().next().value!);
-  return p;
-}
-
-/** A shard's file as hyparquet reads it, counting the bytes fetched. */
-function counted(s: Shard, count: (n: number) => void) {
+/** A file as hyparquet reads it, counting the bytes sliced. */
+function counted(file: FileLike, count: (n: number) => void): FileLike {
   return {
-    byteLength: s.file.byteLength,
+    byteLength: file.byteLength,
     slice: async (start: number, end?: number) => {
-      const buf = await s.file.slice(start, end);
+      const buf = await file.slice(start, end);
       count(buf.byteLength);
       return buf;
     },
   };
+}
+
+/** The column chunks a tile reads: cell, ncell where there is one, the scalar columns and the vector. */
+function wantedColumns(s: Shard, columns: string[], vector: { name: string; dim: number } | null): string[] {
+  if (s.hasNcell === undefined) s.hasNcell = s.metadata.schema.some((e) => e.name === "ncell");
+  return ["cell", ...(s.hasNcell ? ["ncell"] : []), ...columns, ...(vector ? [vector.name] : [])];
+}
+
+/** The one range holding every wanted column chunk of a row group. */
+function groupRange(s: Shard, group: number, wanted: Set<string>): [number, number] {
+  let lo = Infinity, hi = 0;
+  for (const c of s.metadata.row_groups[group].columns) {
+    const m = c.meta_data!;
+    if (!wanted.has(m.path_in_schema[0])) continue;
+    const [a, b] = chunkRange(m);
+    lo = Math.min(lo, a);
+    hi = Math.max(hi, b);
+  }
+  return [lo, hi];
+}
+
+/**
+ * The byte ranges reading tile `tile` takes, for the main thread to fetch:
+ * a tile that is its row group, one range over its wanted column chunks; a
+ * tile that is a page of each column, the page of each wanted column and
+ * the column's dictionary page where it has one (before its first page). A
+ * row group whose page index is not in the footer costs its whole chunks.
+ */
+export function tileRanges(s: Shard, tile: number, columns: string[], vector: { name: string; dim: number } | null): [number, number][] {
+  const loc = s.tiles[tile];
+  const wanted = new Set(wantedColumns(s, columns, vector));
+  if (!loc.shared) return [groupRange(s, loc.rowGroup, wanted)];
+  const idx = pageIndexOf(s, loc.rowGroup, [...wanted]);
+  if (!idx) return [groupRange(s, loc.rowGroup, wanted)];
+  const out: [number, number][] = [];
+  for (const c of idx.values()) {
+    const start = chunkRange(c.meta)[0];
+    if (c.pages.length && start < c.pages[0].offset) out.push([start, c.pages[0].offset]);
+    const p = c.pages[loc.page];
+    if (p) out.push([p.offset, p.offset + p.size]);
+  }
+  return out;
 }
 
 /** The list layout of the vector column of `s`, or null for fixed binary. */
@@ -438,29 +527,22 @@ function flatRows(n: number, chunks: Map<string, ArrayLike<unknown>[]>, columns:
 
 /** Read a whole row group: every requested column, decoded (`tile` is the
  * row group's index). */
-async function readRows(s: Shard, tile: number, columns: string[], vector: { name: string; dim: number } | null, opts: ReadOptions): Promise<Rows> {
+async function readRows(s: Shard, tile: number, columns: string[], vector: { name: string; dim: number } | null, opts: ReadOptions,
+  source: FileLike = s.file): Promise<Rows> {
   const t0 = performance.now();
   let fetched = 0;
   const list = vectorList(s, vector);
-  if (s.hasNcell === undefined) s.hasNcell = s.metadata.schema.some((e) => e.name === "ncell");
   const rg = s.metadata.row_groups[tile];
-  const wanted = new Set(["cell", ...(s.hasNcell ? ["ncell"] : []), ...columns, ...(vector ? [vector.name] : [])]);
+  const wanted = new Set(wantedColumns(s, columns, vector));
   const n = s.rowStarts[tile + 1] - s.rowStarts[tile];
   // one range for every wanted column chunk of the group (their chunks lie
   // together), served to hyparquet and the list reader from memory
-  let file = counted(s, (b) => (fetched += b));
+  let file = counted(source, (b) => (fetched += b));
   if (opts.singleRange ?? true) {
-    let lo = Infinity, hi = 0;
-    for (const c of rg.columns) {
-      const m = c.meta_data!;
-      if (!wanted.has(m.path_in_schema[0])) continue;
-      const [a, b] = chunkRange(m);
-      lo = Math.min(lo, a);
-      hi = Math.max(hi, b);
-    }
-    const buf = await s.file.slice(lo, hi);
+    const [lo, hi] = groupRange(s, tile, wanted);
+    const buf = await source.slice(lo, hi);
     fetched += buf.byteLength;
-    file = { byteLength: s.file.byteLength, slice: async (a: number, b?: number) => buf.slice(a - lo, (b ?? s.file.byteLength) - lo) };
+    file = { byteLength: source.byteLength, slice: async (a: number, b?: number) => buf.slice(a - lo, (b ?? source.byteLength) - lo) };
   }
   const listMeta = list ? rg.columns[list.index].meta_data! : null;
   const chunks = new Map<string, ArrayLike<unknown>[]>();
@@ -497,55 +579,68 @@ async function readRows(s: Shard, tile: number, columns: string[], vector: { nam
   return { n, cells, ncell, values, vector: vec, fetched, readMs: t1 - t0, decodeMs: performance.now() - t1 };
 }
 
-/** A row group's page locations (the offset index) and dictionary pages,
- * for the columns its tiles read, kept per row group. */
-interface TilePages {
-  cols: Map<string, { meta: ColumnMetaData; pages: { offset: number; size: number; first: number }[]; dict: Uint8Array }>;
-  fetched: number;
-}
-const tilePages = new Map<string, Promise<TilePages>>();
+/** A row group's page locations (the offset index) for the columns its
+ * tiles read, kept per row group. */
+type PageIndex = Map<string, { meta: ColumnMetaData; pages: { offset: number; size: number; first: number }[] }>;
+const pageIndexes = new Map<string, PageIndex>();
 
-/** The offset indexes of `names` in row group `group` (from the footer as
- * fetched where it holds them, as a set's does, else one request: they lie
- * together before the footer) and their dictionary pages (one each). */
-async function pagesOf(s: Shard, group: number, names: string[]): Promise<TilePages> {
-  const rg = s.metadata.row_groups[group];
-  const cols = rg.columns.filter((c) => names.includes(c.meta_data!.path_in_schema[0]));
-  if (cols.some((c) => c.offset_index_offset == null)) throw new Error(`row group ${group} holds several tiles but has no page index`);
-  const lo = Math.min(...cols.map((c) => Number(c.offset_index_offset)));
-  const hi = Math.max(...cols.map((c) => Number(c.offset_index_offset) + Number(c.offset_index_length)));
-  let fetched = 0;
-  let buf: ArrayBuffer;
-  if (lo >= s.footerStart) buf = s.footer.slice(lo - s.footerStart, hi - s.footerStart);
-  else {
-    buf = await s.file.slice(lo, hi);
-    fetched += buf.byteLength;
-  }
-  const out: TilePages["cols"] = new Map();
-  await Promise.all(cols.map(async (c) => {
+/** The offset indexes of `names` in row group `group`, parsed from `buf`
+ * (the bytes from `lo`), one entry a column. */
+function parsePageIndex(cols: FileMetaData["row_groups"][number]["columns"], buf: ArrayBuffer, lo: number): PageIndex {
+  const out: PageIndex = new Map();
+  for (const c of cols) {
     const meta = c.meta_data!;
     const at = Number(c.offset_index_offset) - lo;
     const pages = readOffsetIndex({ view: new DataView(buf, at, Number(c.offset_index_length)), offset: 0 }).page_locations.map((l) => ({
       offset: Number(l.offset), size: l.compressed_page_size, first: Number(l.first_row_index),
     }));
-    const start = chunkRange(meta)[0];
-    let dict = new Uint8Array(0);
-    if (pages.length && start < pages[0].offset) {
-      dict = new Uint8Array(await s.file.slice(start, pages[0].offset));
-      fetched += dict.byteLength;
-    }
-    out.set(meta.path_in_schema[0], { meta, pages, dict });
-  }));
-  return { cols: out, fetched };
+    out.set(meta.path_in_schema[0], { meta, pages });
+  }
+  return out;
+}
+
+function indexCols(s: Shard, group: number, names: string[]) {
+  const cols = s.metadata.row_groups[group].columns.filter((c) => names.includes(c.meta_data!.path_in_schema[0]));
+  if (cols.some((c) => c.offset_index_offset == null)) throw new Error(`row group ${group} holds several tiles but has no page index`);
+  const lo = Math.min(...cols.map((c) => Number(c.offset_index_offset)));
+  const hi = Math.max(...cols.map((c) => Number(c.offset_index_offset) + Number(c.offset_index_length)));
+  return { cols, lo, hi };
+}
+
+/** The page index of `names` in row group `group` from the footer as
+ * fetched, where it holds it (as a set's does); null where it does not. */
+function pageIndexOf(s: Shard, group: number, names: string[]): PageIndex | null {
+  const key = `${s.file.url}#${group}`;
+  const hit = pageIndexes.get(key);
+  if (hit) return hit;
+  const { cols, lo, hi } = indexCols(s, group, names);
+  if (lo < s.footerStart) return null;
+  const out = parsePageIndex(cols, s.footer.slice(lo - s.footerStart, hi - s.footerStart), lo);
+  if (pageIndexes.size > 4096) pageIndexes.clear();
+  pageIndexes.set(key, out);
+  return out;
+}
+
+/** The page index of `names` in row group `group`: from the footer, else
+ * one request (the offset indexes lie together before the footer). */
+async function pagesOf(s: Shard, group: number, names: string[], file: FileLike): Promise<{ cols: PageIndex; fetched: number }> {
+  const known = pageIndexOf(s, group, names);
+  if (known) return { cols: known, fetched: 0 };
+  const { cols, lo, hi } = indexCols(s, group, names);
+  const buf = await file.slice(lo, hi);
+  const out = parsePageIndex(cols, buf, lo);
+  pageIndexes.set(`${s.file.url}#${group}`, out);
+  return { cols: out, fetched: buf.byteLength };
 }
 
 /** Read tiles of one row group, each one data page of every column chunk:
- * for each column, one request for each run of consecutive pages the tiles
- * want (the row group's page index and dictionaries read once a worker);
- * flat columns decoded by hyparquet, the list vector by the flat list
- * reader. The fetch is counted against the first tile. */
+ * for each column, one slice for each run of consecutive pages the tiles
+ * want (the row group's page index kept once a worker), with the column's
+ * dictionary page where it has one; flat columns decoded by hyparquet, the
+ * list vector by the flat list reader. The bytes are counted against the
+ * first tile. */
 async function readTilePages(s: Shard, url: string, locs: TileLoc[], columns: string[],
-  vector: { name: string; dim: number } | null): Promise<Rows[]> {
+  vector: { name: string; dim: number } | null, file: FileLike = s.file): Promise<Rows[]> {
   const t0 = performance.now();
   const list = vectorList(s, vector);
   if (s.hasNcell === undefined) s.hasNcell = s.metadata.schema.some((e) => e.name === "ncell");
@@ -555,11 +650,10 @@ async function readTilePages(s: Shard, url: string, locs: TileLoc[], columns: st
   const groupRows = s.rowStarts[group + 1] - s.rowStarts[group];
   const flat = ["cell", ...(s.hasNcell ? ["ncell"] : []), ...columns, ...(vector && !list ? [vector.name] : [])];
   const names = [...flat, ...(list ? [vector!.name] : [])];
-  let first = false;
-  const tp = await cached(tilePages, `${url}#${group}`, 64, () => ((first = true), pagesOf(s, group, names)));
-  let fetched = first ? tp.fetched : 0;
+  const tp = await pagesOf(s, group, names, file);
+  let fetched = tp.fetched;
   const pages = [...new Set(locs.map((l) => l.page))].sort((a, b) => a - b);
-  // each column's pages, a request a run of consecutive pages (which lie
+  // each column's pages, a slice a run of consecutive pages (which lie
   // together in the chunk), all columns at once
   const bytes = new Map<string, Map<number, Uint8Array>>();
   await Promise.all(names.map(async (name) => {
@@ -571,18 +665,24 @@ async function readTilePages(s: Shard, url: string, locs: TileLoc[], columns: st
       const end = k + 1 < c.pages.length ? c.pages[k + 1].first : groupRows;
       if (end - l.start !== l.rows) throw new Error(`page ${k} of ${name} in row group ${group} holds ${end - l.start} rows, its tile ${l.rows}`);
     }
+    const start = chunkRange(c.meta)[0];
+    let dict = new Uint8Array(0);
+    if (c.pages.length && start < c.pages[0].offset) {
+      dict = new Uint8Array(await file.slice(start, c.pages[0].offset));
+      fetched += dict.byteLength;
+    }
     const out = new Map<number, Uint8Array>();
     for (let a = 0; a < pages.length; ) {
       let b = a;
       while (b + 1 < pages.length && pages[b + 1] === pages[b] + 1) b++;
       const lo = c.pages[pages[a]].offset, hi = c.pages[pages[b]].offset + c.pages[pages[b]].size;
-      const buf = await s.file.slice(lo, hi);
+      const buf = await file.slice(lo, hi);
       fetched += buf.byteLength;
       for (let k = a; k <= b; k++) {
         const p = c.pages[pages[k]];
-        const both = new Uint8Array(c.dict.length + p.size);
-        both.set(c.dict);
-        both.set(new Uint8Array(buf, p.offset - lo, p.size), c.dict.length);
+        const both = new Uint8Array(dict.length + p.size);
+        both.set(dict);
+        both.set(new Uint8Array(buf, p.offset - lo, p.size), dict.length);
         out.set(pages[k], both);
       }
       a = b + 1;
@@ -680,14 +780,15 @@ function packRows(r: Rows, a: number, b: number, lod: number, dimOrNull: number 
  * group of several tiles) and pack it. */
 export async function readTile(
   url: string, tile: number, lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
-  opts: ReadOptions = {}, region?: number,
+  opts: ReadOptions = {}, region?: number, pieces?: Piece[],
 ): Promise<PackedTile> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
   const loc = s.tiles[tile];
   if (!loc) throw new Error(`${url} has no tile ${tile}`);
   const dim = vector ? vector.dim : null;
-  const r = loc.shared ? (await readTilePages(s, url, [loc], columns, vector))[0] : await readRows(s, loc.rowGroup, columns, vector, opts);
+  const file = pieces ? piecesFile(url, s.file.byteLength, pieces) : s.file;
+  const r = loc.shared ? (await readTilePages(s, url, [loc], columns, vector, file))[0] : await readRows(s, loc.rowGroup, columns, vector, opts, file);
   const t = performance.now();
   const kept = inRegion(r, s, tile, lod, region != null ? regions.get(region) : undefined);
   const timing = { ...r, decodeMs: r.decodeMs + performance.now() - t };
@@ -698,7 +799,7 @@ export async function readTile(
  * request a column for each run of their pages) and pack them, in order. */
 export async function readTiles(
   url: string, tiles: number[], lod: number, columns: string[], withStats = false, vector: { name: string; dim: number } | null = null,
-  opts: ReadOptions = {}, region?: number,
+  opts: ReadOptions = {}, region?: number, pieces?: Piece[],
 ): Promise<PackedTile[]> {
   const s = shards.get(url);
   if (!s) throw new Error(`shard not open: ${url}`);
@@ -708,10 +809,11 @@ export async function readTiles(
     return loc;
   });
   if (!locs.every((l) => l.shared && l.rowGroup === locs[0].rowGroup)) {
-    return Promise.all(tiles.map((t) => readTile(url, t, lod, columns, withStats, vector, opts, region)));
+    return Promise.all(tiles.map((t) => readTile(url, t, lod, columns, withStats, vector, opts, region, pieces)));
   }
   const dim = vector ? vector.dim : null;
-  const rows = await readTilePages(s, url, locs, columns, vector);
+  const file = pieces ? piecesFile(url, s.file.byteLength, pieces) : s.file;
+  const rows = await readTilePages(s, url, locs, columns, vector, file);
   const reg = region != null ? regions.get(region) : undefined;
   return rows.map((r, k) => {
     const t = performance.now();
@@ -775,21 +877,45 @@ export function transferables(t: PackedTile): ArrayBuffer[] {
 
 /** A message to a decode worker. */
 export type WorkerRequest = (
-  | { id: number; type: "index"; url: string; bytes: number; footer: ArrayBuffer }
+  | {
+      id: number; type: "index"; url: string; bytes: number; footer: ArrayBuffer;
+      /** What tiles will read, so the index lists each tile's byte ranges. */
+      columns?: string[]; vector?: { name: string; dim: number } | null;
+    }
+  /** Compute the region's coverings of `lods` (while footers are in flight), for every worker. */
+  | { id: number; type: "cover"; lods: number[] }
   | {
       id: number; type: "decode"; url: string; bytes: number; footer?: ArrayBuffer; tile: number; lod: number;
       columns: string[]; stats?: boolean; vector?: { name: string; dim: number } | null; read?: ReadOptions;
       /** Several tiles of one row group, read together: one request a
        * column for their pages. The reply has `tiles` in this order. */
       tiles?: number[];
+      /** The file's bytes the tiles need, fetched on the main thread (the
+       * ranges the index listed, or wider); without them the worker fetches. */
+      pieces?: Piece[];
     }
 ) & {
   /** The source's region, by id: tiles are read for it (an index marks the
    * tiles that cannot meet it; a tile drops its rows outside it). */
   region?: number;
-  /** The region's rings, sent with a worker's first request. */
+  /** The region's rings, sent with a worker's first request naming it. */
   regionRings?: Ring[];
+  /** Coverings other workers computed, which this one lacks. */
+  regionCoverings?: Covering[];
 };
+
+/** Each tile's byte ranges, flat: pairs `ranges[2k], ranges[2k + 1]` for
+ * `k` in `[starts[tile], starts[tile + 1])`. */
+export function flatRanges(perTile: [number, number][][]): { ranges: Float64Array; starts: Uint32Array } {
+  const starts = new Uint32Array(perTile.length + 1);
+  let n = 0;
+  perTile.forEach((r, i) => ((starts[i] = n), (n += r.length)));
+  starts[perTile.length] = n;
+  const ranges = new Float64Array(2 * n);
+  let k = 0;
+  for (const r of perTile) for (const [lo, hi] of r) ((ranges[k++] = lo), (ranges[k++] = hi));
+  return { ranges, starts };
+}
 
 /**
  * What a worker does with a message: open a shard (its index, and each
@@ -799,9 +925,25 @@ export type WorkerRequest = (
 export async function handleRequest(m: WorkerRequest): Promise<{ reply: Record<string, unknown>; transfer: ArrayBuffer[] }> {
   try {
     if (m.region != null && m.regionRings) setRegion(m.region, m.regionRings);
+    if (m.regionCoverings) takeCoverings(m.regionCoverings);
     const region = m.region != null ? regions.get(m.region) : undefined;
     if (m.region != null && !region) throw new Error(`region ${m.region} was never sent`);
+    // coverings computed here go back with the reply, for the other workers
+    const withCoverings = (reply: Record<string, unknown>, transfer: ArrayBuffer[]) => {
+      const coverings = freshCoverings();
+      if (coverings.length) {
+        reply.coverings = coverings;
+        transfer.push(...coverings.map((c) => c.ranges.buffer as ArrayBuffer));
+      }
+      return { reply, transfer };
+    };
+    if (m.type === "cover") {
+      const t0 = performance.now();
+      if (region) for (const lod of m.lods) for (let i = 0; i < region.rings.length; i++) rangesAt(region, i, lod);
+      return withCoverings({ id: m.id, ms: performance.now() - t0 }, []);
+    }
     if (m.type === "index") {
+      const t0 = performance.now();
       const md = openShard(m.url, m.bytes, m.footer);
       const s = shards.get(m.url)!;
       const tiles = s.tiles;
@@ -812,21 +954,23 @@ export async function handleRequest(m: WorkerRequest): Promise<{ reply: Record<s
       const tileGroup = tiles.map((t) => (t.shared ? t.rowGroup : -1));
       // with a region: which tiles can hold one of its cells
       const tileMeets = region ? Uint8Array.from(tiles, (_, i) => (tileMeetsRegion(s, i, region) ? 1 : 0)) : null;
-      return {
-        reply: { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes, tileGroup, tileMeets },
-        transfer: tileMeets ? [tileMeets.buffer] : [],
-      };
+      // what the main thread fetches for each tile
+      const { ranges, starts } = flatRanges(tiles.map((_, i) => tileRanges(s, i, m.columns ?? [], m.vector ?? null)));
+      return withCoverings(
+        { id: m.id, kv: keyValues(md), rowGroups: md.row_groups.length, tileRows, tileBytes, tileGroup, tileMeets, ranges, starts, ms: performance.now() - t0 },
+        [...(tileMeets ? [tileMeets.buffer as ArrayBuffer] : []), ranges.buffer as ArrayBuffer, starts.buffer as ArrayBuffer],
+      );
     }
     if (!hasShard(m.url)) {
       if (!m.footer) throw new Error(`no footer for ${m.url}`);
       openShard(m.url, m.bytes, m.footer);
     }
     if (m.tiles && m.tiles.length > 1) {
-      const tiles = await readTiles(m.url, m.tiles, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {}, m.region);
-      return { reply: { id: m.id, tiles }, transfer: tiles.flatMap(transferables) };
+      const tiles = await readTiles(m.url, m.tiles, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {}, m.region, m.pieces);
+      return withCoverings({ id: m.id, tiles }, tiles.flatMap(transferables));
     }
-    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {}, m.region);
-    return { reply: { id: m.id, tile }, transfer: transferables(tile) };
+    const tile = await readTile(m.url, m.tile, m.lod, m.columns, m.stats ?? false, m.vector ?? null, m.read ?? {}, m.region, m.pieces);
+    return withCoverings({ id: m.id, tile }, transferables(tile));
   } catch (e) {
     return { reply: { id: m.id, error: String((e as Error)?.message ?? e) }, transfer: [] };
   }

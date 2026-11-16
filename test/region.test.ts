@@ -112,9 +112,10 @@ for (const [name, set, lods] of [
     });
 
     it("leaves unread the tiles its cells' bounds rule out, where boxes cannot", async () => {
-      const full = await open();
+      // requests counted range by range: no blocks (the fixtures are smaller than one)
+      const full = await open({ block: 0 });
       const ring = triangle(leafBox(full));
-      const s = await open({ region: [ring] });
+      const s = await open({ region: [ring], block: 0 });
       const lod = 18;
       await full.ensure(full.tierOf(lod), WORLD);
       await s.ensure(s.tierOf(lod), WORLD);

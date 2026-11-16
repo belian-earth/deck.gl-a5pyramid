@@ -1,6 +1,6 @@
 # Handoff: deck.gl-a5pyramid
 
-Updated 2026-11-13. Design: `docs/design.md`.
+Updated 2026-11-16. Design: `docs/design.md`.
 
 ## State
 
@@ -11,6 +11,52 @@ Updated 2026-11-13. Design: `docs/design.md`.
   demo installs `github:belian-earth/deck.gl-a5pyramid#v0.1.0`.
   GitHub only for now; npm once the API settles (Hugh, 2026-11-10). Licence
   Apache 2.0, as a5pyramid.
+- Branch `read-pipeline` (2026-11-16, 0.4.0; Hugh: the embeddings' header
+  reads looked slow and the downloads were far from saturating the link,
+  so fetch in parallel). Measured first on Pará's 2022 set from belianapi's
+  store (built from the manifest with S3 presigned URLs, since the
+  session could not use the client credentials): the first project view
+  took 9.4 s, of which footers 1.7 s and the first backdrop tile 3.8 s;
+  reads in flight were bounded by the workers' slots (4 to 8), an urgent
+  index job held every tile read while it computed the region's coverings
+  (305 ms at level 18, again in every worker and for every year's source),
+  and each tile of a row group cost three requests (a tiny cell page, the
+  vector's dictionary page fetched first and alone, then its page).
+  - **Fetch apart from decode.** The index reply lists each tile's byte
+    ranges (`tileRanges`, `flatRanges` in tile-core); the main thread
+    fetches them, `connections` (16) tiles at once, urgent ones up to 8
+    beyond, each with an abort controller, and hands the bytes to a worker
+    as `pieces` (transferred). Ranges under `block` (64 KB) are fetched as
+    kept blocks, so a row group's cell pages and dictionary cost one
+    request between all its tiles. `cancel` aborts a fetch once no job
+    sharing it is wanted. Urgent jobs no longer hold the others back.
+  - **Coverings shared.** `ensure(tier)` sends a cover job for the tier's
+    levels while its footers are in flight; workers report coverings they
+    compute, the main thread keeps them by region (`regionId`, a key of the
+    rings, so sources over the same rings share) and gives them to workers
+    that lack them. `createWorkerPool()` makes a pool several sources share
+    (`pool` option; `close()` leaves it); the ramet47 app uses one across
+    years.
+  - The layer opens the base level's shards once chosen (a store's tiers
+    are one level each, so nothing else opened them and the base never
+    drew) and the tier below the target's with the target's, so a target
+    over the budget costs no second round of footers.
+  - `test/tour-remote.test.ts`: a tour over a remote set given whole
+    (`TOUR_REMOTE`, `TOUR_REGION`, `TOUR_STEPS`; `test/tour-para.json`),
+    through the source as the layer drives it, with worker threads
+    (`test/node-worker-entry.mjs` over `dist`, so `npm run build` first) or
+    in-process, and `TOUR_MODEL` to replay the reads from a disk cache
+    through a latency and bandwidth model of the CDN (deterministic; the
+    S3 path varied by half between runs). The figures are in the design
+    notes: warm CDN the tour 27.7 to 18.3 s, cold 81.6 to 41.6 s, the first
+    project view cold 16.2 to 7.3 s, requests 494 to 274. Unit tests 52
+    (two count requests with `block: 0`, as the fixtures are smaller than
+    a block). Checked in Chrome on the a5-pyramids demo (Sabah's 64-band
+    set over CloudFront, the package installed from `npm pack`): views
+    draw, tiles that left the view are aborted (the extension lists them
+    as 503). Not run here: `npm run test:browser` (CI). To do, by Hugh:
+    merge, tag `v0.4.0`; then ramet47-app's `embeddings-at-once` moves
+    from the branch's commit to the tag.
 - `npm run check`, `npm test` (52 unit tests in Node against fixture sets
   written by a5pyramid) and `npm run test:browser` (GPU colours read
   back in headless Chrome: 134 cells a set, within 1/255 of the formula)
@@ -176,5 +222,10 @@ Updated 2026-11-13. Design: `docs/design.md`.
    renderer, one renderer for both.
 2. Propose to deck.gl: abort loading tiles that left the view whatever the
    number in flight (here an override of `Tileset2D.update`).
-3. From the design notes, not yet taken: fetching apart from decoding,
-   instanced pentagons, a tile-size sweep for 64-byte rows.
+3. From the design notes, not yet taken: instanced pentagons, a tile-size
+   sweep for 64-byte rows. Fetching apart from decoding is 0.4.0.
+4. Costing a one-level tier from the set's rows, without its footers (the
+   budget could then choose the level before any footer arrives; modelled
+   at 9.0 from 11.0 s in the ramet47-app session of 2026-11-13, and 35 to
+   25 MB); and the worker's footer parse (146 KB a leaf file, once a
+   worker) could be replaced by a tile decode spec in the index reply.

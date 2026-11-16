@@ -1,0 +1,10 @@
+[
+  { "name": "project", "center": [-47.4746, -2.0857], "zoom": 13.3 },
+  { "name": "region", "center": [-47.47, -2.08], "zoom": 8.8 },
+  { "name": "mid", "center": [-47.0, -2.4], "zoom": 11 },
+  { "name": "leaves", "center": [-47.0, -2.4], "zoom": 14 },
+  { "name": "pan east", "center": [-46.95, -2.4], "zoom": 14 },
+  { "name": "pan north", "center": [-46.95, -2.36], "zoom": 14 },
+  { "name": "west", "center": [-48.0, -2.0], "zoom": 12 },
+  { "name": "project again", "center": [-47.4746, -2.0857], "zoom": 13.3 }
+]
