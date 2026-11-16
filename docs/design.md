@@ -26,22 +26,47 @@ codes per cell, as AEF's 64-dimensional embeddings).
   in a worker, and kept; the worker also returns each tile's rows and
   compressed bytes, for the view budget. Footers are read only for shards a
   view meets.
-- **Tiles in workers.** A tile is read and decoded in a pool of workers
-  (hyparquet over range requests; hyparquet merges a row group's column
-  chunks), then packed for deck.gl: A5 boundaries from a5-js (open rings),
-  fan triangles for cells at LOD 9 and finer (convex in lon/lat, so deck.gl
-  skips earcut, its largest cost per tile), the codes laid out as a texture
-  (below), and, for PCA, the tile's weighted sums of its decoded values.
-  Packing is mostly `cellToBoundary`, about 3.5 us a cell.
-- **Order.** Each request joins a queue. Urgent requests (shard indexes and
-  the backdrop's tiles) go first, and nothing else starts while one runs, so
-  on a slow link they have the bandwidth. Otherwise the newest batch (one
-  task's requests) is served first, in the order deck.gl asked, which is
-  nearest the view's centre first.
+- **Fetch on the main thread, decode in workers** (since 0.4.0; before it
+  each worker fetched its own tiles, so reads in flight were bounded by the
+  workers' slots, 4 to 8, and a CDN's latency, not its bandwidth, set the
+  pace). The worker that opens a shard lists each tile's byte ranges in its
+  index reply: one range over its column chunks for a tile that is its row
+  group; for a tile that is a page of each column (format version 4), each
+  column's page and its dictionary page. The main thread fetches a tile's
+  ranges, up to `connections` tiles at once (16), each fetch with an abort
+  controller; ranges under `block` (64 KB) are fetched as the blocks
+  holding them and kept, so a row group's cell pages (a few hundred bytes
+  each, DELTA_BINARY_PACKED) and the vector's dictionary page cost one
+  request for all its tiles, and a tile is one request in the usual case.
+  The bytes go to a worker with a free slot (transferred), which decodes
+  them (hyparquet, the flat list reader) and packs the tile for deck.gl: A5
+  boundaries from a5-js (open rings), fan triangles for cells at LOD 9 and
+  finer (convex in lon/lat, so deck.gl skips earcut, its largest cost per
+  tile), the codes laid out as a texture (below), and, for PCA, the tile's
+  weighted sums of its decoded values. Packing is mostly `cellToBoundary`,
+  about 3.5 us a cell.
+- **Order.** Each request joins a queue, and both stages take from it in
+  the same order: urgent requests first (shard indexes, the backdrop's
+  tiles, and the region's coverings), then the newest batch (one task's
+  requests), in the order deck.gl asked, which is nearest the view's centre
+  first. Urgent fetches may exceed `connections` by 8, so they never wait
+  on the others; they no longer hold the others back (before 0.4.0 nothing
+  else started while an urgent job ran, which with a region's coverings in
+  the index job serialised the first view).
 - **Aborts.** deck.gl aborts a loading tile that left the view only when
   more than `maxRequests` are loading; each level's tileset aborts such
-  tiles at once (deck.gl-raster's `abortUnwantedLoads`), and the queue drops
-  a job no one waits for any more.
+  tiles at once (deck.gl-raster's `abortUnwantedLoads`), the queue drops a
+  job no one waits for any more, and a fetch in flight is aborted once no
+  job sharing it is wanted.
+- **A region's coverings.** With a region, each level's covering (a5-js
+  `polygonToCells` of each ring) is needed by the index job (which tiles
+  meet the region) and by every decode (which rows to drop). It is computed
+  once: `ensure(tier)` sends a worker a cover job for the tier's levels
+  while the footers are in flight (Pará's 19 rings: 305 ms at level 18, 80
+  at 16, 0.73 MB of ranges at 18); a worker reports what it computed with
+  its reply, the main thread keeps it by region (a key of the rings, so the
+  years of a store share one) and gives it to the other workers with their
+  next message. A shared pool keeps the workers across sources.
 - **Cache.** Decoded tiles are kept, least recently used dropped first,
   up to `cacheBytes` (512 MB by default), so nothing is read twice while it
   fits.
@@ -145,6 +170,28 @@ deck.gl and luma.gl to 9.4.x:
 - luma.gl 9.4's uniform arrays (`["vec4<f32>", 48]`) and
   `Texture.writeData`.
 
+## Measurements (2026-11-16: the read pipeline)
+
+Pará's 2022 set (a job's embeddings, 55 files, store schema v4, the donor
+region's 19 rings) on a tour of eight views (`test/tour-para.json`), through
+the source as the layer drives it (`test/tour-remote.test.ts`), the reads
+replayed through a model of CloudFront (12 MB/s shared, 0.1 s a request
+warm, 1.3 s cold, a miss on every tile) with in-process workers. 0.3.0
+against 0.4.0:
+
+| | warm, 0.3.0 | warm, 0.4.0 | cold, 0.3.0 | cold, 0.4.0 |
+|---|---|---|---|---|
+| first project view, every tile | 5.7 s | 4.1 s | 16.2 s | 7.3 s |
+| its first backdrop tile | 1.6 s | 1.4 s | 5.6 s | 3.2 s |
+| the tour | 27.7 s | 18.3 s | 81.6 s | 41.6 s |
+| requests | 494 | 274 | 494 | 274 |
+
+Over S3 directly (us-west-2 from London, about 1 s a range, no cache), with
+worker threads, the first project view took 9.4 s on 0.3.0 and 5.9 s on
+0.4.0 (noisy: a repeat gave 9.4). In Chrome the a5-pyramids demo (Sabah,
+the 64-band set over CloudFront) drew its views and aborted the tiles that
+left them.
+
 ## Measurements (2026-11-10, London, laptop with Intel Iris Xe)
 
 - **CloudFront.** One 1 MB range: 0.12 to 0.16 s from the edge (first byte
@@ -161,8 +208,8 @@ deck.gl and luma.gl to 9.4.x:
 Development Seed's raster layers for deck.gl, read for what makes them fast
 (their `examples/aef-mosaic` draws the same AEF embeddings): colour on the
 GPU from codes uploaded once (done here), serve the view's centre first and
-abort what left it (done), choose the level from pixels (done). Not yet
-taken: fetching on the main thread apart from decoding in workers, and
+abort what left it (done), choose the level from pixels (done). Taken in
+0.4.0: fetching on the main thread apart from decoding in workers. Not yet:
 instanced pentagons (every A5 cell at resolution 6 and finer has five
 vertices, so a cell could be five offsets and a fan, about 40 bytes instead
 of 136, skipping deck.gl's tessellator). Range coalescing gains nothing at

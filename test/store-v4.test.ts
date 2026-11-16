@@ -52,7 +52,8 @@ describe("a store's set", () => {
 
   it("reads tiles of one row group together, with fewer requests and the same rows", async () => {
     const counted = async (merge: boolean) => {
-      const s = await open({ merge });
+      // requests counted range by range: no blocks (the fixture is smaller than one)
+      const s = await open({ merge, block: 0 });
       await s.ensure(s.tierOf(18), WORLD);
       const before = served.length;
       const { tiles } = await readLevel(s, 18);

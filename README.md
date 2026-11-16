@@ -21,14 +21,15 @@ Cloud-Optimized GeoTIFFs.
   level of the whole set kept from the start, so pans and jumps show
   something at once; the base is masked where finer data has arrived, so its
   large cells do not stand out past a coast.
-- **Read once.** Tiles decode in workers, nearest the view's centre first;
-  tiles that leave the view are aborted; decoded tiles are cached.
+- **Read once.** Tiles are fetched on the main thread, many at a time, and
+  decoded in workers, nearest the view's centre first; tiles that leave the
+  view are aborted, in flight or not; decoded tiles are cached.
 
 Built for the AlphaEarth Foundations satellite embeddings (64 int8 bands a
 cell) at Belian; any a5pyramid set with int8 columns or an int8 vector column
 draws the same way. How it works, and why: [`docs/design.md`](docs/design.md).
 
-**Status:** 0.1, on GitHub only; the API may change before a release on npm.
+**Status:** 0.4, on GitHub only; the API may change before a release on npm.
 It requires deck.gl and luma.gl 9.4 (it relies on parts of deck.gl that are
 not public API; see the design notes).
 
@@ -117,6 +118,15 @@ const deck = new Deck({ initialViewState: { longitude: 117.8, latitude: 4.96, zo
 - `merge`: tiles of one row group that a view asks for together are read
   with one request a column. Off by default for http(s) URLs, where it cut
   the requests in flight and slowed reads over a CDN; on for local files.
+- `connections` (default 16): tile fetches in flight at once, on the main
+  thread; urgent reads (a shard's index, the backdrop) may add 8 more.
+  `block` (default 64 KB): a range smaller than this is fetched as the
+  blocks holding it and kept, so a row group's tiny cell pages and
+  dictionary pages cost one request between them.
+- `pool`: a pool of decode workers from `createWorkerPool({ workers,
+  connections, block })`, shared by several sources (the years of a store):
+  the workers, the indexes they hold and a region's coverings stay as
+  sources open and close; `terminate()` it yourself.
 - `A5PyramidLayer` props: `source`, `colouring`, `cellPx` (default 1),
   `budget` (`{ bytes, cells }`, default `DEFAULT_BUDGET`, 40 MB and 1.5 M
   cells), `onStats(stats)` (the levels drawn, their tiles, the view's cost),

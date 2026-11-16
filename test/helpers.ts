@@ -2,6 +2,7 @@
 // as a CDN serves them), and a worker that runs in-process.
 
 import { readFileSync, statSync } from "node:fs";
+import { Worker as NodeWorker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { handleRequest, type WorkerRequest } from "../src/tile-core.js";
 import type { SetIndex } from "../src/format.js";
@@ -46,6 +47,19 @@ export class LocalWorker {
   terminate() {}
 }
 export const localWorker = () => new LocalWorker() as unknown as Worker;
+
+/** A worker on its own thread (worker_threads, node-worker-entry.mjs over
+ * the built package), with the browser's Worker shape; for benchmarks. */
+export const nodeWorker = () => {
+  const w = new NodeWorker(new URL("./node-worker-entry.mjs", import.meta.url));
+  const shim = {
+    onmessage: null as ((ev: { data: unknown }) => void) | null,
+    postMessage: (m: unknown, transfer?: Transferable[]) => w.postMessage(m, transfer as any),
+    terminate: () => void w.terminate(),
+  };
+  w.on("message", (data) => shim.onmessage?.({ data }));
+  return shim as unknown as Worker;
+};
 
 export function readSet(name: string): SetIndex {
   return JSON.parse(readFileSync(DIR + name + "/set.json", "utf8"));

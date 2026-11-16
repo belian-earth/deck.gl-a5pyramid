@@ -417,6 +417,9 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
       (lod) => {
         if (this.props.source !== source) return;
         swap.base = lod;
+        // its shards open now, so its tiles are read at once (a store's
+        // tiers are one level each: nothing else opens them)
+        if (lod != null) void source.ensure(source.tierOf(lod), WORLD);
         swap.later();
       },
       () => {},
@@ -565,8 +568,11 @@ export class A5PyramidLayer extends CompositeLayer<A5PyramidLayerProps> {
     const box = viewportBox(vp);
     const target = pickLod(a5Resolution(vp, cellPx), source.lods);
     // the shards of the target's backdrop first, so a coarse view comes
-    // before any judgement of the target's cost
+    // before any judgement of the target's cost; and the level below the
+    // target's with the target's, so a target over the budget costs no
+    // further round of footers
     void source.ensure(source.tierOf(pickLod(target - BACKDROP_STEP, source.lods)), box);
+    void source.ensure(source.tierOf(pickLod(target - 1, source.lods)), box);
     const { lod, capped, cost } = this.chooseLod(target, box);
     const tier = source.tierOf(lod);
     const back = pickLod(lod - BACKDROP_STEP, source.lods);
